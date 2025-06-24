@@ -244,6 +244,25 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 		}
 	}
 
+	// Special handling for common semantic column names (case-insensitive, substring match)
+	colNameLower := strings.ToLower(column.Name)
+	if strings.Contains(colNameLower, "age") {
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			return dg.rand.Intn(121) // 0-120
+		}
+	}
+	if strings.Contains(colNameLower, "salary") {
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			return float64(dg.rand.Intn(1000001))
+		}
+	}
+
 	switch baseType {
 	case "int", "integer", "bigint":
 		return func() interface{} {
@@ -300,12 +319,26 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			}
 			return dg.rand.Float64() * 1000
 		}
-	case "boolean", "bool":
+	case "boolean", "bool", "tinyint":
 		return func() interface{} {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Float32() > 0.5
+		}
+	case "age":
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			return dg.rand.Intn(121) // 0-120
+		}
+	case "salary":
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			return float64(dg.rand.Intn(1000001))
 		}
 	default:
 		return func() interface{} {
