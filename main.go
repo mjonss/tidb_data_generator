@@ -34,6 +34,7 @@ type TableDef struct {
 
 // Statistics structures
 type Stats struct {
+	Count   int                    `json:"count"`
 	Columns map[string]ColumnStats `json:"columns"`
 }
 
@@ -245,7 +246,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 	}
 
 	switch baseType {
-	case "int", "integer", "bigint":
+	case "int", "integer", "bigint", "smallint", "mediumint":
 		return func() interface{} {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
@@ -1115,6 +1116,15 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 	return nil
 }
 
+// Helper function to get effective number of rows
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows int) int {
+	if generator.stats != nil && generator.stats.Count > 0 {
+		fmt.Fprintf(os.Stderr, "Using row count from stats file: %d\n", generator.stats.Count)
+		return generator.stats.Count
+	}
+	return commandLineRows
+}
+
 func main() {
 	// Define command-line flags
 	var (
@@ -1165,7 +1175,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  Data Generation:\n")
 		fmt.Fprintf(os.Stderr, "    --table, -t <table>      Table name (required for database mode)\n")
 		fmt.Fprintf(os.Stderr, "    --sql, -f <file>         SQL file path (required for file mode)\n")
-		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required)\n")
+		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required, or use count from stats file)\n")
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
@@ -1176,6 +1186,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
 		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -n 1000\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -n 1000 -s t.stats.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -s t.stats.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from database\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
@@ -1257,8 +1268,8 @@ func main() {
 	finalWorkers := *workers
 
 	// Validate required parameters
-	if finalNumRows <= 0 {
-		fmt.Fprintf(os.Stderr, "Error: Number of rows (-n/--rows) is required and must be > 0\n")
+	if finalNumRows <= 0 && finalStats == "" {
+		fmt.Fprintf(os.Stderr, "Error: Number of rows (-n/--rows) is required and must be > 0 when no stats file is provided\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -1285,8 +1296,11 @@ func main() {
 			log.Fatalf("Failed to create data generator: %v", err)
 		}
 
+		// Get effective number of rows (from stats if available)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows)
+
 		// Generate data
-		rows := generator.GenerateData(finalNumRows)
+		rows := generator.GenerateData(effectiveNumRows)
 
 		// Output as JSON
 		output, err := json.MarshalIndent(rows, "", "  ")
@@ -1322,6 +1336,9 @@ func main() {
 			log.Fatalf("Failed to create data generator: %v", err)
 		}
 
+		// Get effective number of rows (from stats if available)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows)
+
 		if finalInsert {
 			// Insert data directly to database
 			if finalParallel {
@@ -1329,22 +1346,22 @@ func main() {
 				if finalWorkers == 0 {
 					// Auto-tuning mode
 					if finalBulkInsert {
-						if err := generator.InsertDataToDBBulkParallelAutoTune(config, finalTable, finalNumRows); err != nil {
+						if err := generator.InsertDataToDBBulkParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
 							log.Fatalf("Failed to insert data: %v", err)
 						}
 					} else {
-						if err := generator.InsertDataToDBParallelAutoTune(config, finalTable, finalNumRows); err != nil {
+						if err := generator.InsertDataToDBParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
 							log.Fatalf("Failed to insert data: %v", err)
 						}
 					}
 				} else {
 					// Fixed number of workers
 					if finalBulkInsert {
-						if err := generator.InsertDataToDBBulkParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+						if err := generator.InsertDataToDBBulkParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
 							log.Fatalf("Failed to insert data: %v", err)
 						}
 					} else {
-						if err := generator.InsertDataToDBParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+						if err := generator.InsertDataToDBParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
 							log.Fatalf("Failed to insert data: %v", err)
 						}
 					}
@@ -1352,18 +1369,18 @@ func main() {
 			} else {
 				// Use standard methods
 				if finalBulkInsert {
-					if err := generator.InsertDataToDBBulk(config, finalTable, finalNumRows); err != nil {
+					if err := generator.InsertDataToDBBulk(config, finalTable, effectiveNumRows); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
 				} else {
-					if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
+					if err := generator.InsertDataToDB(config, finalTable, effectiveNumRows); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
 				}
 			}
 		} else {
 			// Generate data and output as JSON
-			rows := generator.GenerateData(finalNumRows)
+			rows := generator.GenerateData(effectiveNumRows)
 			output, err := json.MarshalIndent(rows, "", "  ")
 			if err != nil {
 				log.Fatalf("Failed to marshal data: %v", err)
