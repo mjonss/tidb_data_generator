@@ -1372,8 +1372,7 @@ func main() {
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
 		bulkInsert   = flag.Bool("bulk", false, "Use bulk INSERT for faster database insertion")
-		parallel     = flag.Bool("parallel", false, "Use parallel workers for faster insertion")
-		workers      = flag.Int("workers", 4, "Number of parallel workers (default: 4, 0=auto-tune)")
+		workers      = flag.Int("workers", 1, "Number of parallel workers (default: 1=serial, >1=parallel, 0=auto-tune)")
 
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
@@ -1399,8 +1398,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
-		fmt.Fprintf(os.Stderr, "    --parallel               Use parallel workers for faster insertion\n")
-		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 4, 0=auto-tune)\n")
+		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 1=serial, >1=parallel, 0=auto-tune)\n")
 		fmt.Fprintf(os.Stderr, "    --verbose                Enable verbose debug output\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
@@ -1413,20 +1411,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
-		fmt.Fprintf(os.Stderr, "  # Insert data directly to database (standard method)\n")
+		fmt.Fprintf(os.Stderr, "  # Insert data directly to database (serial, 1 worker)\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using bulk INSERT (faster)\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
-		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers (fastest)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers (8 workers)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --workers 8\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers with bulk INSERT (fastest)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --bulk --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 8\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using auto-tuning (finds optimal worker count)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --bulk --workers 0\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 0\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -1487,7 +1485,6 @@ func main() {
 
 	finalInsert := *insert || *insertShort
 	finalBulkInsert := *bulkInsert
-	finalParallel := *parallel
 	finalWorkers := *workers
 	finalVerbose := *verbose
 
@@ -1573,39 +1570,36 @@ func main() {
 
 		if finalInsert {
 			// Insert data directly to database
-			if finalParallel {
-				// Use parallel methods
-				if finalWorkers == 0 {
-					// Auto-tuning mode
-					if finalBulkInsert {
-						if err := generator.InsertDataToDBBulkParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
-							log.Fatalf("Failed to insert data: %v", err)
-						}
-					} else {
-						if err := generator.InsertDataToDBParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
-							log.Fatalf("Failed to insert data: %v", err)
-						}
+			if finalWorkers == 0 {
+				// Auto-tuning mode
+				if finalBulkInsert {
+					if err := generator.InsertDataToDBBulkParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
 					}
 				} else {
-					// Fixed number of workers
-					if finalBulkInsert {
-						if err := generator.InsertDataToDBBulkParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
-							log.Fatalf("Failed to insert data: %v", err)
-						}
-					} else {
-						if err := generator.InsertDataToDBParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
-							log.Fatalf("Failed to insert data: %v", err)
-						}
+					if err := generator.InsertDataToDBParallelAutoTune(config, finalTable, effectiveNumRows); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
 					}
 				}
-			} else {
-				// Use standard methods
+			} else if finalWorkers == 1 {
+				// Serial processing (1 worker)
 				if finalBulkInsert {
 					if err := generator.InsertDataToDBBulk(config, finalTable, effectiveNumRows); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
 				} else {
 					if err := generator.InsertDataToDB(config, finalTable, effectiveNumRows); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
+				}
+			} else {
+				// Parallel processing (multiple workers)
+				if finalBulkInsert {
+					if err := generator.InsertDataToDBBulkParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
+				} else {
+					if err := generator.InsertDataToDBParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
 				}
