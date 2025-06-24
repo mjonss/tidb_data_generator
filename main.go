@@ -4,12 +4,12 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -372,8 +372,14 @@ func (dg *DataGenerator) generateTimeFromStats(columnName string) time.Time {
 							upperTime, err := time.Parse("2006-01-02 15:04:05", string(upperBound))
 							if err == nil {
 								duration := upperTime.Sub(lowerTime)
-								randomDuration := time.Duration(dg.rand.Int63n(int64(duration)))
-								return lowerTime.Add(randomDuration)
+								// Check if duration is valid (positive)
+								if duration > 0 {
+									randomDuration := time.Duration(dg.rand.Int63n(int64(duration)))
+									return lowerTime.Add(randomDuration)
+								} else {
+									// If duration is zero or negative, return the lower time
+									return lowerTime
+								}
 							}
 						}
 					}
@@ -621,121 +627,156 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 }
 
 func main() {
-	if len(os.Args) < 3 {
-		fmt.Println("Usage:")
-		fmt.Println("  From SQL file: go run main.go <sql_file> <num_rows> [stats_file]")
-		fmt.Println("  From database: go run main.go --db <host:port> <user> <password> <database> <table> <num_rows> [stats_file]")
-		fmt.Println("  Insert to database: go run main.go --insert --db <host:port> <user> <password> <database> <table> <num_rows> [stats_file]")
-		fmt.Println("")
-		fmt.Println("Examples:")
-		fmt.Println("  go run main.go t.create.sql 1000")
-		fmt.Println("  go run main.go t.create.sql 1000 t.stats.json")
-		fmt.Println("  go run main.go --db localhost:4000 root password testdb mytable 1000")
-		fmt.Println("  go run main.go --db localhost:4000 root password testdb mytable 1000 t.stats.json")
-		fmt.Println("  go run main.go --insert --db localhost:4000 root password testdb mytable 1000 t.stats.json")
+	// Define command-line flags
+	var (
+		// Database connection flags
+		host     = flag.String("host", "localhost", "Database host")
+		port     = flag.Int("port", 3306, "Database port")
+		user     = flag.String("user", "root", "Database user")
+		password = flag.String("password", "", "Database password")
+		database = flag.String("database", "", "Database name")
+
+		// Short versions
+		hostShort     = flag.String("H", "localhost", "Database host (short)")
+		portShort     = flag.Int("P", 3306, "Database port (short)")
+		userShort     = flag.String("u", "root", "Database user (short)")
+		passwordShort = flag.String("p", "", "Database password (short)")
+		databaseShort = flag.String("D", "", "Database name (short)")
+
+		// Other flags
+		table        = flag.String("table", "", "Table name")
+		tableShort   = flag.String("t", "", "Table name (short)")
+		stats        = flag.String("stats", "", "Stats file path")
+		statsShort   = flag.String("s", "", "Stats file path (short)")
+		sqlFile      = flag.String("sql", "", "SQL file path")
+		sqlFileShort = flag.String("f", "", "SQL file path (short)")
+		numRows      = flag.Int("rows", 0, "Number of rows to generate")
+		numRowsShort = flag.Int("n", 0, "Number of rows to generate (short)")
+		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
+		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
+
+		// Help
+		help      = flag.Bool("help", false, "Show help message")
+		helpShort = flag.Bool("h", false, "Show help message (short)")
+	)
+
+	// Custom usage message
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		fmt.Fprintf(os.Stderr, "  Database Connection:\n")
+		fmt.Fprintf(os.Stderr, "    --host, -H <host>        Database host (default: localhost)\n")
+		fmt.Fprintf(os.Stderr, "    --port, -P <port>        Database port (default: 3306)\n")
+		fmt.Fprintf(os.Stderr, "    --user, -u <user>        Database user (default: root)\n")
+		fmt.Fprintf(os.Stderr, "    --password, -p <pass>    Database password\n")
+		fmt.Fprintf(os.Stderr, "    --database, -D <db>      Database name\n")
+		fmt.Fprintf(os.Stderr, "  Data Generation:\n")
+		fmt.Fprintf(os.Stderr, "    --table, -t <table>      Table name (required for database mode)\n")
+		fmt.Fprintf(os.Stderr, "    --sql, -f <file>         SQL file path (required for file mode)\n")
+		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required)\n")
+		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
+		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
+		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
+		fmt.Fprintf(os.Stderr, "Examples:\n")
+		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
+		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -n 1000\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -n 1000 -s t.stats.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Generate JSON from database\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data directly to database\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i\n", os.Args[0])
+	}
+
+	flag.Parse()
+
+	// Check for help
+	if *help || *helpShort {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	// Resolve conflicting flags (long form takes precedence)
+	finalHost := *host
+	if *hostShort != "localhost" {
+		finalHost = *hostShort
+	}
+
+	finalPort := *port
+	if *portShort != 3306 {
+		finalPort = *portShort
+	}
+
+	finalUser := *user
+	if *userShort != "root" {
+		finalUser = *userShort
+	}
+
+	finalPassword := *password
+	if *passwordShort != "" {
+		finalPassword = *passwordShort
+	}
+
+	finalDatabase := *database
+	if *databaseShort != "" {
+		finalDatabase = *databaseShort
+	}
+
+	finalTable := *table
+	if *tableShort != "" {
+		finalTable = *tableShort
+	}
+
+	finalStats := *stats
+	if *statsShort != "" {
+		finalStats = *statsShort
+	}
+
+	finalSQLFile := *sqlFile
+	if *sqlFileShort != "" {
+		finalSQLFile = *sqlFileShort
+	}
+
+	finalNumRows := *numRows
+	if *numRowsShort != 0 {
+		finalNumRows = *numRowsShort
+	}
+
+	finalInsert := *insert || *insertShort
+
+	// Validate required parameters
+	if finalNumRows <= 0 {
+		fmt.Fprintf(os.Stderr, "Error: Number of rows (-n/--rows) is required and must be > 0\n")
+		flag.Usage()
 		os.Exit(1)
 	}
 
+	// Determine mode and validate parameters
 	var tableDef *TableDef
 	var err error
-	var insertMode bool
 
-	if os.Args[1] == "--insert" {
-		insertMode = true
-		// Remove --insert from args and shift everything
-		os.Args = append(os.Args[:1], os.Args[2:]...)
-	}
-
-	if os.Args[1] == "--db" {
-		// Database mode
-		if len(os.Args) < 8 || len(os.Args) > 9 {
-			fmt.Println("Database mode requires: --db <host:port> <user> <password> <database> <table> <num_rows> [stats_file]")
+	if finalSQLFile != "" {
+		// File mode
+		if finalTable != "" || finalHost != "localhost" || finalPort != 3306 || finalUser != "root" || finalPassword != "" || finalDatabase != "" {
+			fmt.Fprintf(os.Stderr, "Error: Database parameters should not be specified when using SQL file mode\n")
+			flag.Usage()
 			os.Exit(1)
 		}
 
-		// Parse host:port
-		hostPort := strings.Split(os.Args[2], ":")
-		if len(hostPort) != 2 {
-			fmt.Println("Invalid host:port format. Use format like 'localhost:4000'")
-			os.Exit(1)
-		}
-		host := hostPort[0]
-		port, _ := strconv.Atoi(hostPort[1])
-		if port == 0 {
-			fmt.Printf("Invalid port number: %s\n", hostPort[1])
-			os.Exit(1)
-		}
-
-		config := DBConfig{
-			Host:     host,
-			Port:     port,
-			User:     os.Args[3],
-			Password: os.Args[4],
-			Database: os.Args[5],
-		}
-		tableName := os.Args[6]
-		numRowsStr := os.Args[7]
-		statsFile := ""
-		if len(os.Args) == 9 {
-			statsFile = os.Args[8]
-		}
-
-		tableDef, err = parseTableFromDB(config, tableName)
+		tableDef, err = parseCreateTable(finalSQLFile)
 		if err != nil {
-			log.Fatalf("Failed to parse table from database: %v", err)
+			log.Fatalf("Failed to parse SQL file: %v", err)
 		}
 
-		numRows, err := strconv.Atoi(numRowsStr)
-		if err != nil {
-			log.Fatalf("Invalid number of rows: %v", err)
-		}
-
-		generator, err := NewDataGeneratorFromTableDef(tableDef, statsFile)
-		if err != nil {
-			log.Fatalf("Failed to create data generator: %v", err)
-		}
-
-		if insertMode {
-			// Insert data directly to database
-			if err := generator.InsertDataToDB(config, tableName, numRows); err != nil {
-				log.Fatalf("Failed to insert data: %v", err)
-			}
-		} else {
-			// Generate data and output as JSON
-			rows := generator.GenerateData(numRows)
-			output, err := json.MarshalIndent(rows, "", "  ")
-			if err != nil {
-				log.Fatalf("Failed to marshal data: %v", err)
-			}
-			fmt.Println(string(output))
-		}
-
-	} else {
-		// File mode (existing functionality)
-		if len(os.Args) < 3 || len(os.Args) > 4 {
-			fmt.Println("File mode requires: <sql_file> <num_rows> [stats_file]")
-			os.Exit(1)
-		}
-
-		sqlFile := os.Args[1]
-		numRowsStr := os.Args[2]
-		statsFile := ""
-		if len(os.Args) == 4 {
-			statsFile = os.Args[3]
-		}
-
-		numRows, err := strconv.Atoi(numRowsStr)
-		if err != nil {
-			log.Fatalf("Invalid number of rows: %v", err)
-		}
-
-		generator, err := NewDataGenerator(sqlFile, statsFile)
+		generator, err := NewDataGenerator(finalSQLFile, finalStats)
 		if err != nil {
 			log.Fatalf("Failed to create data generator: %v", err)
 		}
 
 		// Generate data
-		rows := generator.GenerateData(numRows)
+		rows := generator.GenerateData(finalNumRows)
 
 		// Output as JSON
 		output, err := json.MarshalIndent(rows, "", "  ")
@@ -744,5 +785,52 @@ func main() {
 		}
 
 		fmt.Println(string(output))
+
+	} else if finalTable != "" && finalDatabase != "" {
+		// Database mode
+		if finalSQLFile != "" {
+			fmt.Fprintf(os.Stderr, "Error: SQL file should not be specified when using database mode\n")
+			flag.Usage()
+			os.Exit(1)
+		}
+
+		config := DBConfig{
+			Host:     finalHost,
+			Port:     finalPort,
+			User:     finalUser,
+			Password: finalPassword,
+			Database: finalDatabase,
+		}
+
+		tableDef, err = parseTableFromDB(config, finalTable)
+		if err != nil {
+			log.Fatalf("Failed to parse table from database: %v", err)
+		}
+
+		generator, err := NewDataGeneratorFromTableDef(tableDef, finalStats)
+		if err != nil {
+			log.Fatalf("Failed to create data generator: %v", err)
+		}
+
+		if finalInsert {
+			// Insert data directly to database
+			if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
+				log.Fatalf("Failed to insert data: %v", err)
+			}
+		} else {
+			// Generate data and output as JSON
+			rows := generator.GenerateData(finalNumRows)
+			output, err := json.MarshalIndent(rows, "", "  ")
+			if err != nil {
+				log.Fatalf("Failed to marshal data: %v", err)
+			}
+			fmt.Println(string(output))
+		}
+
+	} else {
+		// Invalid mode
+		fmt.Fprintf(os.Stderr, "Error: Must specify either SQL file (-f/--sql) or database table (-t/--table) with database (-D/--database)\n")
+		flag.Usage()
+		os.Exit(1)
 	}
 }
