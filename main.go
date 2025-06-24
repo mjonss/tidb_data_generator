@@ -713,6 +713,114 @@ func getNextAvailableID(config DBConfig, tableDef *TableDef) (int, error) {
 	return 1, nil
 }
 
+// Simplified insert method for benchmarking (no progress output)
+func (dg *DataGenerator) InsertDataToDBBenchmark(config DBConfig, tableName string, numRows int) error {
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Connect to database
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Configure connection pool for better performance
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(placeholders, ", "))
+
+	// Get the next available ID to avoid duplicate key errors
+	nextID, err := getNextAvailableID(config, dg.tableDef)
+	if err != nil {
+		return fmt.Errorf("failed to get next available ID: %w", err)
+	}
+
+	// Use larger batch size for better performance
+	batchSize := 5000
+
+	// Generate and insert data in batches
+	for i := 0; i < numRows; i += batchSize {
+		end := i + batchSize
+		if end > numRows {
+			end = numRows
+		}
+
+		// Start transaction for batch
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+
+		// Prepare statement for this transaction
+		stmt, err := tx.Prepare(insertSQL)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to prepare statement: %w", err)
+		}
+
+		// Generate all rows for this batch first
+		rows := make([][]interface{}, 0, end-i)
+		for j := i; j < end; j++ {
+			row := dg.GenerateRow(nextID + j)
+
+			// Convert row to interface slice for query - skip auto-increment columns
+			values := make([]interface{}, 0, len(dg.tableDef.Columns))
+			for _, column := range dg.tableDef.Columns {
+				// Skip auto-increment columns
+				if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+					continue
+				}
+				values = append(values, row[column.Name])
+			}
+			rows = append(rows, values)
+		}
+
+		// Execute all inserts in this batch
+		for _, values := range rows {
+			_, err := stmt.Exec(values...)
+			if err != nil {
+				stmt.Close()
+				tx.Rollback()
+				return fmt.Errorf("failed to insert row: %w", err)
+			}
+		}
+
+		stmt.Close()
+
+		// Commit transaction
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit transaction: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Standard insert method (non-parallel)
 func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRows int) error {
 	// Create DSN (Data Source Name) with performance optimizations
@@ -1332,38 +1440,52 @@ finished:
 func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableName string, numRows int) error {
 	fmt.Fprintf(os.Stderr, "Auto-tuning parallel insert for %d rows...\n", numRows)
 
-	// Start with 1 worker and measure performance
+	benchmarkDuration := 2 * time.Second
+	maxWorkers := 512
 	bestWorkers := 1
 	bestPerformance := 0.0
+	benchmarkedRows := 0
 
-	// Test different worker counts
-	for workers := 1; workers <= 16; workers *= 2 {
-		fmt.Fprintf(os.Stderr, "Testing with %d workers...\n", workers)
+	for workers := 1; workers <= maxWorkers; workers *= 2 {
+		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		rowsInserted := 0
+		stopTime := time.Now().Add(benchmarkDuration)
 
-		// Measure performance with this worker count
-		startTime := time.Now()
-		err := dg.InsertDataToDBParallel(config, tableName, numRows, workers)
-		if err != nil {
-			return fmt.Errorf("auto-tuning failed with %d workers: %w", workers, err)
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				batchSize := 100
+				for {
+					if time.Now().After(stopTime) {
+						return
+					}
+					dg.InsertDataToDBBenchmark(config, tableName, batchSize)
+					mu.Lock()
+					rowsInserted += batchSize
+					mu.Unlock()
+				}
+			}()
 		}
-
-		elapsed := time.Since(startTime)
-		performance := float64(numRows) / elapsed.Seconds()
-
+		wg.Wait()
+		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
 		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
-
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
-		}
-
-		// If performance is decreasing, stop testing
-		if workers > 1 && performance < bestPerformance*0.8 {
+			benchmarkedRows = rowsInserted
+		} else if workers > 1 && performance < bestPerformance*0.8 {
 			break
 		}
 	}
-
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
+	remainingRows := numRows - benchmarkedRows
+	if remainingRows > 0 {
+		fmt.Fprintf(os.Stderr, "Inserting remaining %d rows with %d workers...\n", remainingRows, bestWorkers)
+		return dg.InsertDataToDBParallel(config, tableName, remainingRows, bestWorkers)
+	}
 	return nil
 }
 
@@ -1371,38 +1493,52 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tableName string, numRows int) error {
 	fmt.Fprintf(os.Stderr, "Auto-tuning parallel bulk insert for %d rows...\n", numRows)
 
-	// Start with 1 worker and measure performance
+	benchmarkDuration := 2 * time.Second
+	maxWorkers := 512
 	bestWorkers := 1
 	bestPerformance := 0.0
+	benchmarkedRows := 0
 
-	// Test different worker counts
-	for workers := 1; workers <= 16; workers *= 2 {
-		fmt.Fprintf(os.Stderr, "Testing with %d workers...\n", workers)
+	for workers := 1; workers <= maxWorkers; workers *= 2 {
+		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		rowsInserted := 0
+		stopTime := time.Now().Add(benchmarkDuration)
 
-		// Measure performance with this worker count
-		startTime := time.Now()
-		err := dg.InsertDataToDBBulkParallel(config, tableName, numRows, workers)
-		if err != nil {
-			return fmt.Errorf("auto-tuning failed with %d workers: %w", workers, err)
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				batchSize := 100
+				for {
+					if time.Now().After(stopTime) {
+						return
+					}
+					dg.InsertDataToDBBulkParallel(config, tableName, batchSize, 1)
+					mu.Lock()
+					rowsInserted += batchSize
+					mu.Unlock()
+				}
+			}()
 		}
-
-		elapsed := time.Since(startTime)
-		performance := float64(numRows) / elapsed.Seconds()
-
+		wg.Wait()
+		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
 		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
-
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
-		}
-
-		// If performance is decreasing, stop testing
-		if workers > 1 && performance < bestPerformance*0.8 {
+			benchmarkedRows = rowsInserted
+		} else if workers > 1 && performance < bestPerformance*0.8 {
 			break
 		}
 	}
-
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
+	remainingRows := numRows - benchmarkedRows
+	if remainingRows > 0 {
+		fmt.Fprintf(os.Stderr, "Inserting remaining %d rows with %d workers...\n", remainingRows, bestWorkers)
+		return dg.InsertDataToDBBulkParallel(config, tableName, remainingRows, bestWorkers)
+	}
 	return nil
 }
 
