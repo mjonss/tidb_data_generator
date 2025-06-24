@@ -1037,6 +1037,84 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 	return nil
 }
 
+// Auto-tuning parallel insert method
+func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableName string, numRows int) error {
+	fmt.Fprintf(os.Stderr, "Auto-tuning parallel insert for %d rows...\n", numRows)
+
+	// Start with 1 worker and measure performance
+	bestWorkers := 1
+	bestPerformance := 0.0
+
+	// Test different worker counts
+	for workers := 1; workers <= 16; workers *= 2 {
+		fmt.Fprintf(os.Stderr, "Testing with %d workers...\n", workers)
+
+		// Measure performance with this worker count
+		startTime := time.Now()
+		err := dg.InsertDataToDBParallel(config, tableName, numRows, workers)
+		if err != nil {
+			return fmt.Errorf("auto-tuning failed with %d workers: %w", workers, err)
+		}
+
+		elapsed := time.Since(startTime)
+		performance := float64(numRows) / elapsed.Seconds()
+
+		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
+
+		if performance > bestPerformance {
+			bestPerformance = performance
+			bestWorkers = workers
+		}
+
+		// If performance is decreasing, stop testing
+		if workers > 1 && performance < bestPerformance*0.8 {
+			break
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
+	return nil
+}
+
+// Auto-tuning parallel bulk insert method
+func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tableName string, numRows int) error {
+	fmt.Fprintf(os.Stderr, "Auto-tuning parallel bulk insert for %d rows...\n", numRows)
+
+	// Start with 1 worker and measure performance
+	bestWorkers := 1
+	bestPerformance := 0.0
+
+	// Test different worker counts
+	for workers := 1; workers <= 16; workers *= 2 {
+		fmt.Fprintf(os.Stderr, "Testing with %d workers...\n", workers)
+
+		// Measure performance with this worker count
+		startTime := time.Now()
+		err := dg.InsertDataToDBBulkParallel(config, tableName, numRows, workers)
+		if err != nil {
+			return fmt.Errorf("auto-tuning failed with %d workers: %w", workers, err)
+		}
+
+		elapsed := time.Since(startTime)
+		performance := float64(numRows) / elapsed.Seconds()
+
+		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
+
+		if performance > bestPerformance {
+			bestPerformance = performance
+			bestWorkers = workers
+		}
+
+		// If performance is decreasing, stop testing
+		if workers > 1 && performance < bestPerformance*0.8 {
+			break
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
+	return nil
+}
+
 func main() {
 	// Define command-line flags
 	var (
@@ -1067,7 +1145,7 @@ func main() {
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
 		bulkInsert   = flag.Bool("bulk", false, "Use bulk INSERT for faster database insertion")
 		parallel     = flag.Bool("parallel", false, "Use parallel workers for faster insertion")
-		workers      = flag.Int("workers", 4, "Number of parallel workers (default: 4)")
+		workers      = flag.Int("workers", 4, "Number of parallel workers (default: 4, 0=auto-tune)")
 
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
@@ -1092,7 +1170,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
 		fmt.Fprintf(os.Stderr, "    --parallel               Use parallel workers for faster insertion\n")
-		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 4)\n")
+		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 4, 0=auto-tune)\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
@@ -1114,6 +1192,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers with bulk INSERT (fastest)\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --bulk --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data using auto-tuning (finds optimal worker count)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --bulk --workers 0\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -1245,13 +1326,27 @@ func main() {
 			// Insert data directly to database
 			if finalParallel {
 				// Use parallel methods
-				if finalBulkInsert {
-					if err := generator.InsertDataToDBBulkParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
+				if finalWorkers == 0 {
+					// Auto-tuning mode
+					if finalBulkInsert {
+						if err := generator.InsertDataToDBBulkParallelAutoTune(config, finalTable, finalNumRows); err != nil {
+							log.Fatalf("Failed to insert data: %v", err)
+						}
+					} else {
+						if err := generator.InsertDataToDBParallelAutoTune(config, finalTable, finalNumRows); err != nil {
+							log.Fatalf("Failed to insert data: %v", err)
+						}
 					}
 				} else {
-					if err := generator.InsertDataToDBParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
+					// Fixed number of workers
+					if finalBulkInsert {
+						if err := generator.InsertDataToDBBulkParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+							log.Fatalf("Failed to insert data: %v", err)
+						}
+					} else {
+						if err := generator.InsertDataToDBParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+							log.Fatalf("Failed to insert data: %v", err)
+						}
 					}
 				}
 			} else {
