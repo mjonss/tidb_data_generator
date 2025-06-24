@@ -273,11 +273,14 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			// Try to use stats if available
 			if dg.stats != nil {
 				if _, exists := dg.stats.Columns[column.Name]; exists {
-					return dg.generateTimeFromStats(column.Name)
+					timeValue := dg.generateTimeFromStats(column.Name)
+					// Format datetime without microseconds for database compatibility
+					return timeValue.Format("2006-01-02 15:04:05")
 				}
 			}
 			// Fallback to random time
-			return time.Now().Add(time.Duration(dg.rand.Int63n(365*24*60*60)) * time.Second)
+			randomTime := time.Now().Add(time.Duration(dg.rand.Int63n(365*24*60*60)) * time.Second)
+			return randomTime.Format("2006-01-02 15:04:05")
 		}
 	case "date":
 		return func() interface{} {
