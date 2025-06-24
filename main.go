@@ -985,13 +985,14 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		strings.Join(columnNames, ", "),
 		strings.Join(placeholders, ", "))
 
-	// Use larger batch size for parallel operations
-	batchSize := 2000
+	// Use smaller batch size for better progress reporting
+	batchSize := 1000
 	startTime := time.Now()
 
 	// Create channels for coordination
 	jobs := make(chan int, numRows)
 	results := make(chan error, numWorkers)
+	progress := make(chan int, numWorkers) // Channel for progress updates
 	var wg sync.WaitGroup
 
 	// Start worker goroutines
@@ -1061,6 +1062,9 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 					results <- fmt.Errorf("worker %d failed to commit transaction: %w", workerID, err)
 					return
 				}
+
+				// Send progress update
+				progress <- endRow - startRow
 			}
 		}(w)
 	}
@@ -1077,24 +1081,61 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 	go func() {
 		wg.Wait()
 		close(results)
+		close(progress)
 	}()
 
 	// Monitor progress and collect errors
 	completedRows := 0
-	for err := range results {
-		if err != nil {
-			return fmt.Errorf("parallel insert failed: %w", err)
-		}
-		completedRows += batchSize
-		if completedRows > numRows {
-			completedRows = numRows
-		}
+	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
+	defer progressTicker.Stop()
 
-		elapsed := time.Since(startTime)
-		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+	// Create a channel to signal when all work is done
+	done := make(chan bool)
+
+	// Start progress monitoring goroutine
+	go func() {
+		for {
+			select {
+			case <-progressTicker.C:
+				if completedRows > 0 {
+					elapsed := time.Since(startTime)
+					rate := float64(completedRows) / elapsed.Seconds()
+					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Collect progress updates and errors
+	for {
+		select {
+		case batchSize, ok := <-progress:
+			if !ok {
+				// Progress channel closed, check for errors
+				for err := range results {
+					if err != nil {
+						done <- true
+						return fmt.Errorf("parallel insert failed: %w", err)
+					}
+				}
+				done <- true
+				goto finished
+			}
+			completedRows += batchSize
+			if completedRows > numRows {
+				completedRows = numRows
+			}
+		case err := <-results:
+			if err != nil {
+				done <- true
+				return fmt.Errorf("parallel insert failed: %w", err)
+			}
+		}
 	}
 
+finished:
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
 	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
@@ -1147,13 +1188,14 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		placeholders = append(placeholders, "?")
 	}
 
-	// Use larger batch size for parallel bulk operations
-	batchSize := 5000
+	// Use smaller batch size for better progress reporting
+	batchSize := 1000
 	startTime := time.Now()
 
 	// Create channels for coordination
 	jobs := make(chan int, numRows)
 	results := make(chan error, numWorkers)
+	progress := make(chan int, numWorkers) // Channel for progress updates
 	var wg sync.WaitGroup
 
 	// Start worker goroutines
@@ -1206,6 +1248,9 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
 					return
 				}
+
+				// Send progress update
+				progress <- endRow - startRow
 			}
 		}(w)
 	}
@@ -1222,24 +1267,60 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 	go func() {
 		wg.Wait()
 		close(results)
+		close(progress)
 	}()
-
 	// Monitor progress and collect errors
 	completedRows := 0
-	for err := range results {
-		if err != nil {
-			return fmt.Errorf("parallel bulk insert failed: %w", err)
-		}
-		completedRows += batchSize
-		if completedRows > numRows {
-			completedRows = numRows
-		}
+	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
+	defer progressTicker.Stop()
 
-		elapsed := time.Since(startTime)
-		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+	// Create a channel to signal when all work is done
+	done := make(chan bool)
+
+	// Start progress monitoring goroutine
+	go func() {
+		for {
+			select {
+			case <-progressTicker.C:
+				if completedRows > 0 {
+					elapsed := time.Since(startTime)
+					rate := float64(completedRows) / elapsed.Seconds()
+					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Collect progress updates and errors
+	for {
+		select {
+		case batchSize, ok := <-progress:
+			if !ok {
+				// Progress channel closed, check for errors
+				for err := range results {
+					if err != nil {
+						done <- true
+						return fmt.Errorf("parallel bulk insert failed: %w", err)
+					}
+				}
+				done <- true
+				goto finished
+			}
+			completedRows += batchSize
+			if completedRows > numRows {
+				completedRows = numRows
+			}
+		case err := <-results:
+			if err != nil {
+				done <- true
+				return fmt.Errorf("parallel bulk insert failed: %w", err)
+			}
+		}
 	}
 
+finished:
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
 	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
