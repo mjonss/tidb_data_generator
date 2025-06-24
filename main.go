@@ -536,8 +536,8 @@ func NewDataGeneratorFromTableDef(tableDef *TableDef, statsFile string) (*DataGe
 }
 
 func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRows int) error {
-	// Create DSN (Data Source Name)
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
 
 	// Connect to database
@@ -546,6 +546,11 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
+
+	// Configure connection pool for better performance
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
 
 	// Test connection
 	if err := db.Ping(); err != nil {
@@ -572,15 +577,11 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s...\n", numRows, tableName)
 
-	// Prepare statement
-	stmt, err := db.Prepare(insertSQL)
-	if err != nil {
-		return fmt.Errorf("failed to prepare insert statement: %w", err)
-	}
-	defer stmt.Close()
+	// Use larger batch size for better performance
+	batchSize := 5000
+	startTime := time.Now()
 
 	// Generate and insert data in batches
-	batchSize := 1000
 	for i := 0; i < numRows; i += batchSize {
 		end := i + batchSize
 		if end > numRows {
@@ -594,8 +595,14 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		}
 
 		// Prepare statement for this transaction
-		txStmt := tx.Stmt(stmt)
+		stmt, err := tx.Prepare(insertSQL)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to prepare statement: %w", err)
+		}
 
+		// Generate all rows for this batch first
+		rows := make([][]interface{}, 0, end-i)
 		for j := i; j < end; j++ {
 			row := dg.GenerateRow(j + 1)
 
@@ -608,24 +615,125 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 				}
 				values = append(values, row[column.Name])
 			}
+			rows = append(rows, values)
+		}
 
-			// Execute insert
-			_, err := txStmt.Exec(values...)
+		// Execute all inserts in this batch
+		for _, values := range rows {
+			_, err := stmt.Exec(values...)
 			if err != nil {
+				stmt.Close()
 				tx.Rollback()
-				return fmt.Errorf("failed to insert row %d: %w", j+1, err)
+				return fmt.Errorf("failed to insert row: %w", err)
 			}
 		}
+
+		stmt.Close()
 
 		// Commit transaction
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("failed to commit transaction: %w", err)
 		}
 
-		fmt.Fprintf(os.Stderr, "Inserted %d rows...\n", end)
+		elapsed := time.Since(startTime)
+		rate := float64(end) / elapsed.Seconds()
+		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
 	}
 
-	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s\n", numRows, tableName)
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+		numRows, tableName, totalTime.Seconds(), totalRate)
+	return nil
+}
+
+// Alternative method using bulk INSERT with multiple VALUES
+func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, numRows int) error {
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Connect to database
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Configure connection pool for better performance
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using bulk inserts...\n", numRows, tableName)
+
+	// Use larger batch size for bulk inserts
+	batchSize := 10000
+	startTime := time.Now()
+
+	// Generate and insert data in batches
+	for i := 0; i < numRows; i += batchSize {
+		end := i + batchSize
+		if end > numRows {
+			end = numRows
+		}
+
+		// Build bulk INSERT statement
+		valueGroups := make([]string, 0, end-i)
+		allValues := make([]interface{}, 0, (end-i)*len(placeholders))
+
+		for j := i; j < end; j++ {
+			row := dg.GenerateRow(j + 1)
+			valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+			// Convert row to interface slice for query - skip auto-increment columns
+			for _, column := range dg.tableDef.Columns {
+				// Skip auto-increment columns
+				if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+					continue
+				}
+				allValues = append(allValues, row[column.Name])
+			}
+		}
+
+		bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+			tableName,
+			strings.Join(columnNames, ", "),
+			strings.Join(valueGroups, ", "))
+
+		// Execute bulk insert
+		_, err := db.Exec(bulkInsertSQL, allValues...)
+		if err != nil {
+			return fmt.Errorf("failed to execute bulk insert: %w", err)
+		}
+
+		elapsed := time.Since(startTime)
+		rate := float64(end) / elapsed.Seconds()
+		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
+	}
+
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
 
@@ -657,6 +765,7 @@ func main() {
 		numRowsShort = flag.Int("n", 0, "Number of rows to generate (short)")
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
+		bulkInsert   = flag.Bool("bulk", false, "Use bulk INSERT for faster database insertion")
 
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
@@ -679,6 +788,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required)\n")
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
+		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
@@ -689,8 +799,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
-		fmt.Fprintf(os.Stderr, "  # Insert data directly to database\n")
+		fmt.Fprintf(os.Stderr, "  # Insert data directly to database (standard method)\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data using bulk INSERT (faster)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -748,6 +861,7 @@ func main() {
 	}
 
 	finalInsert := *insert || *insertShort
+	finalBulkInsert := *bulkInsert
 
 	// Validate required parameters
 	if finalNumRows <= 0 {
@@ -817,8 +931,14 @@ func main() {
 
 		if finalInsert {
 			// Insert data directly to database
-			if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
-				log.Fatalf("Failed to insert data: %v", err)
+			if finalBulkInsert {
+				if err := generator.InsertDataToDBBulk(config, finalTable, finalNumRows); err != nil {
+					log.Fatalf("Failed to insert data: %v", err)
+				}
+			} else {
+				if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
+					log.Fatalf("Failed to insert data: %v", err)
+				}
 			}
 		} else {
 			// Generate data and output as JSON
