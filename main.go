@@ -17,6 +17,16 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+// Global verbose flag
+var verboseMode bool
+
+// Debug helper function
+func debugPrint(format string, args ...interface{}) {
+	if verboseMode {
+		fmt.Fprintf(os.Stderr, format, args...)
+	}
+}
+
 // Column definition structure
 type ColumnDef struct {
 	Name     string
@@ -28,8 +38,10 @@ type ColumnDef struct {
 
 // Table definition structure
 type TableDef struct {
-	Name    string
-	Columns []ColumnDef
+	Name       string
+	Columns    []ColumnDef
+	PrimaryKey []string
+	UniqueKeys [][]string // Each unique key is a list of column names
 }
 
 // Statistics structures
@@ -210,7 +222,15 @@ func parseStatsFile(statsFile string) (*Stats, error) {
 
 func (dg *DataGenerator) initializeColumnGenerators() {
 	for _, column := range dg.tableDef.Columns {
-		dg.columnGenerators[column.Name] = dg.createColumnGenerator(column)
+		// Skip primary key columns - they will be set directly in GenerateRow
+		isPrimaryKey := false
+		if len(dg.tableDef.PrimaryKey) == 1 && column.Name == dg.tableDef.PrimaryKey[0] {
+			isPrimaryKey = true
+		}
+
+		if !isPrimaryKey {
+			dg.columnGenerators[column.Name] = dg.createColumnGenerator(column)
+		}
 	}
 }
 
@@ -402,7 +422,13 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	row := make(TableRow)
 
 	for _, column := range dg.tableDef.Columns {
-		if column.Name == "id" {
+		// Check if this column is the primary key
+		isPrimaryKey := false
+		if len(dg.tableDef.PrimaryKey) == 1 && column.Name == dg.tableDef.PrimaryKey[0] {
+			isPrimaryKey = true
+		}
+
+		if isPrimaryKey {
 			row[column.Name] = id
 		} else {
 			generator := dg.columnGenerators[column.Name]
@@ -414,9 +440,69 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 }
 
 func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
-	rows := make([]TableRow, numRows)
-	for i := 0; i < numRows; i++ {
-		rows[i] = dg.GenerateRow(i + 1)
+	rows := make([]TableRow, 0, numRows)
+	// Track unique values for all unique/primary key columns/tuples
+	uniqueSets := make([]map[string]struct{}, 0)
+	keyCols := make([][]string, 0)
+	if len(dg.tableDef.PrimaryKey) > 0 {
+		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
+	}
+	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
+	for range keyCols {
+		uniqueSets = append(uniqueSets, make(map[string]struct{}))
+	}
+
+	nextInt := 1
+	for len(rows) < numRows {
+		row := make(TableRow)
+		// For integer single-column PK/UK, generate sequentially
+		for _, colSet := range keyCols {
+			if len(colSet) == 1 {
+				colName := colSet[0]
+				colType := ""
+				for _, c := range dg.tableDef.Columns {
+					if c.Name == colName {
+						colType = c.Type
+						break
+					}
+				}
+				if strings.Contains(colType, "int") {
+					row[colName] = nextInt
+				}
+			}
+		}
+		// Generate other columns
+		for _, column := range dg.tableDef.Columns {
+			if _, ok := row[column.Name]; ok {
+				continue // already set
+			}
+			generator := dg.columnGenerators[column.Name]
+			row[column.Name] = generator()
+		}
+		// Check uniqueness
+		isUnique := true
+		for i, colSet := range keyCols {
+			key := ""
+			for _, col := range colSet {
+				key += fmt.Sprintf("|%v", row[col])
+			}
+			if _, exists := uniqueSets[i][key]; exists {
+				isUnique = false
+				break
+			}
+		}
+		if isUnique {
+			for i, colSet := range keyCols {
+				key := ""
+				for _, col := range colSet {
+					key += fmt.Sprintf("|%v", row[col])
+				}
+				uniqueSets[i][key] = struct{}{}
+			}
+			rows = append(rows, row)
+			nextInt++
+		}
+		// else: retry
 	}
 	return rows
 }
@@ -507,9 +593,52 @@ func parseTableFromDB(config DBConfig, tableName string) (*TableDef, error) {
 		return nil, fmt.Errorf("no columns found for table %s", tableName)
 	}
 
+	// Query primary key and unique keys
+	pkQuery := `
+		SELECT COLUMN_NAME
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION`
+	pkRows, err := db.Query(pkQuery, config.Database, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query primary key: %w", err)
+	}
+	defer pkRows.Close()
+	primaryKey := []string{}
+	for pkRows.Next() {
+		var col string
+		if err := pkRows.Scan(&col); err == nil {
+			primaryKey = append(primaryKey, col)
+		}
+	}
+
+	uniqueQuery := `
+		SELECT INDEX_NAME, COLUMN_NAME
+		FROM INFORMATION_SCHEMA.STATISTICS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0 AND INDEX_NAME != 'PRIMARY'
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX`
+	uniqueRows, err := db.Query(uniqueQuery, config.Database, tableName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query unique keys: %w", err)
+	}
+	defer uniqueRows.Close()
+	uniqueKeyMap := map[string][]string{}
+	for uniqueRows.Next() {
+		var idx, col string
+		if err := uniqueRows.Scan(&idx, &col); err == nil {
+			uniqueKeyMap[idx] = append(uniqueKeyMap[idx], col)
+		}
+	}
+	uniqueKeys := [][]string{}
+	for _, cols := range uniqueKeyMap {
+		uniqueKeys = append(uniqueKeys, cols)
+	}
+
 	return &TableDef{
-		Name:    tableName,
-		Columns: columns,
+		Name:       tableName,
+		Columns:    columns,
+		PrimaryKey: primaryKey,
+		UniqueKeys: uniqueKeys,
 	}, nil
 }
 
@@ -535,6 +664,53 @@ func NewDataGeneratorFromTableDef(tableDef *TableDef, statsFile string) (*DataGe
 	generator.initializeColumnGenerators()
 
 	return generator, nil
+}
+
+// Get the next available value for a single-column integer primary key
+func getNextAvailableID(config DBConfig, tableDef *TableDef) (int, error) {
+	if len(tableDef.PrimaryKey) != 1 {
+		// Only support single-column PK for now
+		debugPrint("[DEBUG] getNextAvailableID: not a single-column PK\n")
+		return 1, nil
+	}
+	pkCol := tableDef.PrimaryKey[0]
+	var pkType string
+	for _, col := range tableDef.Columns {
+		if col.Name == pkCol {
+			pkType = col.Type
+			break
+		}
+	}
+	if !(strings.Contains(pkType, "int")) {
+		// Only support integer PK for now
+		debugPrint("[DEBUG] getNextAvailableID: PK is not integer type (%s)\n", pkType)
+		return 1, nil
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		debugPrint("[DEBUG] getNextAvailableID: failed to connect: %v\n", err)
+		return 1, fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Try to get the maximum PK value from the table
+	var maxID sql.NullInt64
+	query := fmt.Sprintf("SELECT MAX(%s) FROM %s", pkCol, tableDef.Name)
+	debugPrint("[DEBUG] getNextAvailableID: executing query: %s\n", query)
+	err = db.QueryRow(query).Scan(&maxID)
+	if err != nil {
+		debugPrint("[DEBUG] getNextAvailableID: query failed: %v\n", err)
+		return 1, nil
+	}
+	debugPrint("[DEBUG] getNextAvailableID: maxID.Valid=%v, maxID.Int64=%d\n", maxID.Valid, maxID.Int64)
+	if maxID.Valid {
+		return int(maxID.Int64) + 1, nil
+	}
+	return 1, nil
 }
 
 // Standard insert method (non-parallel)
@@ -580,6 +756,13 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s...\n", numRows, tableName)
 
+	// Get the next available ID to avoid duplicate key errors
+	nextID, err := getNextAvailableID(config, dg.tableDef)
+	if err != nil {
+		return fmt.Errorf("failed to get next available ID: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+
 	// Use larger batch size for better performance
 	batchSize := 5000
 	startTime := time.Now()
@@ -607,7 +790,12 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		// Generate all rows for this batch first
 		rows := make([][]interface{}, 0, end-i)
 		for j := i; j < end; j++ {
-			row := dg.GenerateRow(j + 1)
+			row := dg.GenerateRow(nextID + j)
+
+			// Debug: show first few generated IDs
+			if j < 5 {
+				debugPrint("[DEBUG] Generated row %d with ID: %v\n", j, row[dg.tableDef.PrimaryKey[0]])
+			}
 
 			// Convert row to interface slice for query - skip auto-increment columns
 			values := make([]interface{}, 0, len(dg.tableDef.Columns))
@@ -688,6 +876,13 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using bulk inserts...\n", numRows, tableName)
 
+	// Get the next available ID to avoid duplicate key errors
+	nextID, err := getNextAvailableID(config, dg.tableDef)
+	if err != nil {
+		return fmt.Errorf("failed to get next available ID: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+
 	// Use larger batch size for bulk inserts
 	batchSize := 10000
 	startTime := time.Now()
@@ -704,7 +899,7 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 		allValues := make([]interface{}, 0, (end-i)*len(placeholders))
 
 		for j := i; j < end; j++ {
-			row := dg.GenerateRow(j + 1)
+			row := dg.GenerateRow(nextID + j)
 			valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
 
 			// Convert row to interface slice for query - skip auto-increment columns
@@ -742,6 +937,15 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 
 // Parallel insert method using multiple goroutines
 func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
+
+	// Get the next available ID to avoid duplicate key errors
+	nextID, err := getNextAvailableID(config, dg.tableDef)
+	if err != nil {
+		return fmt.Errorf("failed to get next available ID: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+
 	// Create DSN (Data Source Name) with performance optimizations
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -754,7 +958,7 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 	defer db.Close()
 
 	// Configure connection pool for parallel operations
-	db.SetMaxOpenConns(numWorkers * 2) // Allow more connections for parallel workers
+	db.SetMaxOpenConns(numWorkers * 2)
 	db.SetMaxIdleConns(numWorkers)
 	db.SetConnMaxLifetime(time.Hour)
 
@@ -780,8 +984,6 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		tableName,
 		strings.Join(columnNames, ", "),
 		strings.Join(placeholders, ", "))
-
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
 
 	// Use larger batch size for parallel operations
 	batchSize := 2000
@@ -833,7 +1035,7 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 
 				// Generate and insert rows for this batch
 				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(rowID + 1)
+					row := dg.GenerateRow(nextID + rowID)
 
 					// Convert row to interface slice for query - skip auto-increment columns
 					values := make([]interface{}, 0, len(dg.tableDef.Columns))
@@ -902,6 +1104,15 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 
 // Parallel bulk insert method
 func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
+
+	// Get the next available ID to avoid duplicate key errors
+	nextID, err := getNextAvailableID(config, dg.tableDef)
+	if err != nil {
+		return fmt.Errorf("failed to get next available ID: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+
 	// Create DSN (Data Source Name) with performance optimizations
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -935,8 +1146,6 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
 		placeholders = append(placeholders, "?")
 	}
-
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
 
 	// Use larger batch size for parallel bulk operations
 	batchSize := 5000
@@ -973,7 +1182,7 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 				allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
 
 				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(rowID + 1)
+					row := dg.GenerateRow(nextID + rowID)
 					valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
 
 					// Convert row to interface slice for query - skip auto-increment columns
@@ -1117,12 +1326,20 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 }
 
 // Helper function to get effective number of rows
-func getEffectiveNumRows(generator *DataGenerator, commandLineRows int) int {
-	if generator.stats != nil && generator.stats.Count > 0 {
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int) int {
+	effectiveRows := commandLineRows
+	if commandLineRows <= 0 && generator.stats != nil && generator.stats.Count > 0 {
 		fmt.Fprintf(os.Stderr, "Using row count from stats file: %d\n", generator.stats.Count)
-		return generator.stats.Count
+		effectiveRows = generator.stats.Count
 	}
-	return commandLineRows
+
+	// Apply max rows limit if specified
+	if maxRows > 0 && effectiveRows > maxRows {
+		fmt.Fprintf(os.Stderr, "Limiting rows to maximum: %d (requested: %d)\n", maxRows, effectiveRows)
+		effectiveRows = maxRows
+	}
+
+	return effectiveRows
 }
 
 func main() {
@@ -1151,6 +1368,7 @@ func main() {
 		sqlFileShort = flag.String("f", "", "SQL file path (short)")
 		numRows      = flag.Int("rows", 0, "Number of rows to generate")
 		numRowsShort = flag.Int("n", 0, "Number of rows to generate (short)")
+		maxRows      = flag.Int("max-rows", 0, "Maximum number of rows to generate (0=no limit)")
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
 		bulkInsert   = flag.Bool("bulk", false, "Use bulk INSERT for faster database insertion")
@@ -1160,6 +1378,7 @@ func main() {
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
 		helpShort = flag.Bool("h", false, "Show help message (short)")
+		verbose   = flag.Bool("verbose", false, "Enable verbose debug output")
 	)
 
 	// Custom usage message
@@ -1176,11 +1395,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --table, -t <table>      Table name (required for database mode)\n")
 		fmt.Fprintf(os.Stderr, "    --sql, -f <file>         SQL file path (required for file mode)\n")
 		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required, or use count from stats file)\n")
+		fmt.Fprintf(os.Stderr, "    --max-rows <num>         Maximum number of rows to generate (0=no limit)\n")
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
 		fmt.Fprintf(os.Stderr, "    --parallel               Use parallel workers for faster insertion\n")
 		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 4, 0=auto-tune)\n")
+		fmt.Fprintf(os.Stderr, "    --verbose                Enable verbose debug output\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
@@ -1262,10 +1483,19 @@ func main() {
 		finalNumRows = *numRowsShort
 	}
 
+	finalMaxRows := *maxRows
+
 	finalInsert := *insert || *insertShort
 	finalBulkInsert := *bulkInsert
 	finalParallel := *parallel
 	finalWorkers := *workers
+	finalVerbose := *verbose
+
+	// Set global verbose flag
+	verboseMode = finalVerbose
+
+	// Debug print for resolved row count
+	debugPrint("[DEBUG] finalNumRows: %d\n", finalNumRows)
 
 	// Validate required parameters
 	if finalNumRows <= 0 && finalStats == "" {
@@ -1297,7 +1527,8 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		// Generate data
 		rows := generator.GenerateData(effectiveNumRows)
@@ -1337,7 +1568,8 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		if finalInsert {
 			// Insert data directly to database
