@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -535,6 +536,7 @@ func NewDataGeneratorFromTableDef(tableDef *TableDef, statsFile string) (*DataGe
 	return generator, nil
 }
 
+// Standard insert method (non-parallel)
 func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRows int) error {
 	// Create DSN (Data Source Name) with performance optimizations
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
@@ -737,6 +739,304 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 	return nil
 }
 
+// Parallel insert method using multiple goroutines
+func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Connect to database
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Configure connection pool for parallel operations
+	db.SetMaxOpenConns(numWorkers * 2) // Allow more connections for parallel workers
+	db.SetMaxIdleConns(numWorkers)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(placeholders, ", "))
+
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
+
+	// Use larger batch size for parallel operations
+	batchSize := 2000
+	startTime := time.Now()
+
+	// Create channels for coordination
+	jobs := make(chan int, numRows)
+	results := make(chan error, numWorkers)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			// Each worker gets its own database connection
+			workerDB, err := sql.Open("mysql", dsn)
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
+				return
+			}
+			defer workerDB.Close()
+
+			// Prepare statement for this worker
+			stmt, err := workerDB.Prepare(insertSQL)
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to prepare statement: %w", workerID, err)
+				return
+			}
+			defer stmt.Close()
+
+			// Process jobs
+			for startRow := range jobs {
+				endRow := startRow + batchSize
+				if endRow > numRows {
+					endRow = numRows
+				}
+
+				// Start transaction for this batch
+				tx, err := workerDB.Begin()
+				if err != nil {
+					results <- fmt.Errorf("worker %d failed to begin transaction: %w", workerID, err)
+					return
+				}
+
+				// Prepare statement for this transaction
+				txStmt := tx.Stmt(stmt)
+
+				// Generate and insert rows for this batch
+				for rowID := startRow; rowID < endRow; rowID++ {
+					row := dg.GenerateRow(rowID + 1)
+
+					// Convert row to interface slice for query - skip auto-increment columns
+					values := make([]interface{}, 0, len(dg.tableDef.Columns))
+					for _, column := range dg.tableDef.Columns {
+						// Skip auto-increment columns
+						if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+							continue
+						}
+						values = append(values, row[column.Name])
+					}
+
+					// Execute insert
+					_, err := txStmt.Exec(values...)
+					if err != nil {
+						tx.Rollback()
+						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, rowID+1, err)
+						return
+					}
+				}
+
+				// Commit transaction
+				if err := tx.Commit(); err != nil {
+					results <- fmt.Errorf("worker %d failed to commit transaction: %w", workerID, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs to workers
+	go func() {
+		for i := 0; i < numRows; i += batchSize {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Monitor progress and collect errors
+	completedRows := 0
+	for err := range results {
+		if err != nil {
+			return fmt.Errorf("parallel insert failed: %w", err)
+		}
+		completedRows += batchSize
+		if completedRows > numRows {
+			completedRows = numRows
+		}
+
+		elapsed := time.Since(startTime)
+		rate := float64(completedRows) / elapsed.Seconds()
+		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+	}
+
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+		numRows, tableName, totalTime.Seconds(), totalRate)
+	return nil
+}
+
+// Parallel bulk insert method
+func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Connect to database
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Configure connection pool for parallel operations
+	db.SetMaxOpenConns(numWorkers * 2)
+	db.SetMaxIdleConns(numWorkers)
+	db.SetConnMaxLifetime(time.Hour)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
+
+	// Use larger batch size for parallel bulk operations
+	batchSize := 5000
+	startTime := time.Now()
+
+	// Create channels for coordination
+	jobs := make(chan int, numRows)
+	results := make(chan error, numWorkers)
+	var wg sync.WaitGroup
+
+	// Start worker goroutines
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			// Each worker gets its own database connection
+			workerDB, err := sql.Open("mysql", dsn)
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
+				return
+			}
+			defer workerDB.Close()
+
+			// Process jobs
+			for startRow := range jobs {
+				endRow := startRow + batchSize
+				if endRow > numRows {
+					endRow = numRows
+				}
+
+				// Build bulk INSERT statement for this batch
+				valueGroups := make([]string, 0, endRow-startRow)
+				allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
+
+				for rowID := startRow; rowID < endRow; rowID++ {
+					row := dg.GenerateRow(rowID + 1)
+					valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+					// Convert row to interface slice for query - skip auto-increment columns
+					for _, column := range dg.tableDef.Columns {
+						// Skip auto-increment columns
+						if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+							continue
+						}
+						allValues = append(allValues, row[column.Name])
+					}
+				}
+
+				bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+					tableName,
+					strings.Join(columnNames, ", "),
+					strings.Join(valueGroups, ", "))
+
+				// Execute bulk insert
+				_, err := workerDB.Exec(bulkInsertSQL, allValues...)
+				if err != nil {
+					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
+					return
+				}
+			}
+		}(w)
+	}
+
+	// Send jobs to workers
+	go func() {
+		for i := 0; i < numRows; i += batchSize {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Monitor progress and collect errors
+	completedRows := 0
+	for err := range results {
+		if err != nil {
+			return fmt.Errorf("parallel bulk insert failed: %w", err)
+		}
+		completedRows += batchSize
+		if completedRows > numRows {
+			completedRows = numRows
+		}
+
+		elapsed := time.Since(startTime)
+		rate := float64(completedRows) / elapsed.Seconds()
+		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+	}
+
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+		numRows, tableName, totalTime.Seconds(), totalRate)
+	return nil
+}
+
 func main() {
 	// Define command-line flags
 	var (
@@ -766,6 +1066,8 @@ func main() {
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
 		bulkInsert   = flag.Bool("bulk", false, "Use bulk INSERT for faster database insertion")
+		parallel     = flag.Bool("parallel", false, "Use parallel workers for faster insertion")
+		workers      = flag.Int("workers", 4, "Number of parallel workers (default: 4)")
 
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
@@ -789,6 +1091,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion\n")
+		fmt.Fprintf(os.Stderr, "    --parallel               Use parallel workers for faster insertion\n")
+		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 4)\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from SQL file\n")
@@ -804,6 +1108,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using bulk INSERT (faster)\n")
 		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers (fastest)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers with bulk INSERT (fastest)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --parallel --bulk --workers 8\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -862,6 +1172,8 @@ func main() {
 
 	finalInsert := *insert || *insertShort
 	finalBulkInsert := *bulkInsert
+	finalParallel := *parallel
+	finalWorkers := *workers
 
 	// Validate required parameters
 	if finalNumRows <= 0 {
@@ -931,13 +1243,27 @@ func main() {
 
 		if finalInsert {
 			// Insert data directly to database
-			if finalBulkInsert {
-				if err := generator.InsertDataToDBBulk(config, finalTable, finalNumRows); err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
+			if finalParallel {
+				// Use parallel methods
+				if finalBulkInsert {
+					if err := generator.InsertDataToDBBulkParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
+				} else {
+					if err := generator.InsertDataToDBParallel(config, finalTable, finalNumRows, finalWorkers); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
 				}
 			} else {
-				if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
+				// Use standard methods
+				if finalBulkInsert {
+					if err := generator.InsertDataToDBBulk(config, finalTable, finalNumRows); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
+				} else {
+					if err := generator.InsertDataToDB(config, finalTable, finalNumRows); err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
 				}
 			}
 		} else {
