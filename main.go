@@ -22,6 +22,7 @@ type ColumnDef struct {
 	Type     string
 	Nullable bool
 	Default  string
+	Extra    string
 }
 
 // Table definition structure
@@ -176,11 +177,18 @@ func parseColumnDefinition(name, definition string) ColumnDef {
 		defaultValue = defaultMatch[1]
 	}
 
+	// Extract extra information (like auto_increment)
+	extra := ""
+	if strings.Contains(strings.ToUpper(definition), "AUTO_INCREMENT") {
+		extra = "auto_increment"
+	}
+
 	return ColumnDef{
 		Name:     name,
 		Type:     dataType,
 		Nullable: nullable,
 		Default:  defaultValue,
+		Extra:    extra,
 	}
 }
 
@@ -211,17 +219,41 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 		baseType = baseType[:idx]
 	}
 
+	// Calculate null probability from stats if available
+	nullProbability := 0.0
+	if dg.stats != nil {
+		if columnStats, exists := dg.stats.Columns[column.Name]; exists {
+			// If we have stats, calculate null probability based on actual data
+			// For now, we'll use a small probability if null_count is 0, or a higher one if it's > 0
+			if columnStats.NullCount > 0 {
+				nullProbability = 0.1 // 10% if there were nulls in original data
+			} else {
+				nullProbability = 0.0 // 0% if no nulls in original data
+			}
+		} else {
+			// No stats available, use default behavior for nullable columns
+			if column.Nullable {
+				nullProbability = 0.1 // 10% default for nullable columns
+			}
+		}
+	} else {
+		// No stats file, use default behavior for nullable columns
+		if column.Nullable {
+			nullProbability = 0.1 // 10% default for nullable columns
+		}
+	}
+
 	switch baseType {
 	case "int", "integer", "bigint":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Intn(10000)
 		}
 	case "varchar", "char", "text":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			// Try to use stats if available
@@ -235,7 +267,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 		}
 	case "timestamp", "datetime":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			// Try to use stats if available
@@ -249,7 +281,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 		}
 	case "date":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			// Generate random date
@@ -259,21 +291,21 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 		}
 	case "float", "double", "decimal":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Float64() * 1000
 		}
 	case "boolean", "bool":
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Float32() > 0.5
 		}
 	default:
 		return func() interface{} {
-			if column.Nullable && dg.rand.Float32() < 0.1 { // 10% null chance
+			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return fmt.Sprintf("unknown_type_%d", dg.rand.Intn(100))
@@ -404,7 +436,8 @@ func parseTableFromDB(config DBConfig, tableName string) (*TableDef, error) {
 			COLUMN_DEFAULT,
 			CHARACTER_MAXIMUM_LENGTH,
 			NUMERIC_PRECISION,
-			NUMERIC_SCALE
+			NUMERIC_SCALE,
+			EXTRA
 		FROM INFORMATION_SCHEMA.COLUMNS 
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
@@ -425,10 +458,11 @@ func parseTableFromDB(config DBConfig, tableName string) (*TableDef, error) {
 			charLength   sql.NullInt64
 			numPrecision sql.NullInt64
 			numScale     sql.NullInt64
+			extra        string
 		)
 
 		if err := rows.Scan(&columnName, &dataType, &isNullable, &defaultValue,
-			&charLength, &numPrecision, &numScale); err != nil {
+			&charLength, &numPrecision, &numScale, &extra); err != nil {
 			return nil, fmt.Errorf("failed to scan column info: %w", err)
 		}
 
@@ -449,6 +483,7 @@ func parseTableFromDB(config DBConfig, tableName string) (*TableDef, error) {
 			Type:     dataTypeLower,
 			Nullable: isNullable == "YES",
 			Default:  defaultValue.String,
+			Extra:    extra,
 		}
 		columns = append(columns, column)
 	}
@@ -508,11 +543,15 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	// Build INSERT statement
+	// Build INSERT statement - skip auto-increment columns
 	columnNames := make([]string, 0, len(dg.tableDef.Columns))
 	placeholders := make([]string, 0, len(dg.tableDef.Columns))
 
 	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
 		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
 		placeholders = append(placeholders, "?")
 	}
@@ -551,9 +590,13 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		for j := i; j < end; j++ {
 			row := dg.GenerateRow(j + 1)
 
-			// Convert row to interface slice for query
+			// Convert row to interface slice for query - skip auto-increment columns
 			values := make([]interface{}, 0, len(dg.tableDef.Columns))
 			for _, column := range dg.tableDef.Columns {
+				// Skip auto-increment columns
+				if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+					continue
+				}
 				values = append(values, row[column.Name])
 			}
 
