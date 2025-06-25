@@ -2036,8 +2036,35 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 	return nil
 }
 
+// Get the current row count from a table
+func getCurrentRowCount(config DBConfig, tableName string) (int, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return 0, fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return 0, fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
+	var count int
+	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", tableName)
+	err = db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get row count: %w", err)
+	}
+
+	return count, nil
+}
+
 // Helper function to get effective number of rows
-func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int) int {
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int, config *DBConfig, tableName string, isInsertMode bool) int {
 	effectiveRows := commandLineRows
 	if commandLineRows <= 0 && generator.stats != nil && generator.stats.Count > 0 {
 		fmt.Fprintf(os.Stderr, "Using row count from stats file: %d\n", generator.stats.Count)
@@ -2048,6 +2075,23 @@ func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows 
 	if maxRows > 0 && effectiveRows > maxRows {
 		fmt.Fprintf(os.Stderr, "Limiting rows to maximum: %d (requested: %d)\n", maxRows, effectiveRows)
 		effectiveRows = maxRows
+	}
+
+	// If in insert mode and we have a target count, consider existing rows
+	if isInsertMode && effectiveRows > 0 && config != nil && tableName != "" {
+		currentCount, err := getCurrentRowCount(*config, tableName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to get current row count: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Proceeding with full target count: %d\n", effectiveRows)
+		} else {
+			if currentCount >= effectiveRows {
+				fmt.Fprintf(os.Stderr, "Table already has %d rows, which meets or exceeds target of %d rows. No insert needed.\n", currentCount, effectiveRows)
+				return 0
+			}
+			rowsToInsert := effectiveRows - currentCount
+			fmt.Fprintf(os.Stderr, "Table has %d existing rows, will insert %d additional rows to reach target of %d\n", currentCount, rowsToInsert, effectiveRows)
+			effectiveRows = rowsToInsert
+		}
 	}
 
 	return effectiveRows
@@ -2235,7 +2279,7 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, nil, finalTable, finalInsert)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		// Generate data
@@ -2276,10 +2320,16 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, &config, finalTable, finalInsert)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		if finalInsert {
+			// Check if no rows need to be inserted
+			if effectiveNumRows <= 0 {
+				fmt.Fprintf(os.Stderr, "No rows need to be inserted. Exiting.\n")
+				return
+			}
+
 			// Insert data directly to database
 			if finalWorkers == 0 {
 				// Auto-tuning mode
