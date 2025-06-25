@@ -421,22 +421,53 @@ func (dg *DataGenerator) generateTimeFromStats(columnName string) time.Time {
 func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	row := make(TableRow)
 
-	for _, column := range dg.tableDef.Columns {
-		// Check if this column is the primary key
-		isPrimaryKey := false
-		if len(dg.tableDef.PrimaryKey) == 1 && column.Name == dg.tableDef.PrimaryKey[0] {
-			isPrimaryKey = true
-		}
+	// Identify all unique/primary key columns
+	keyCols := make([][]string, 0)
+	if len(dg.tableDef.PrimaryKey) > 0 {
+		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
+	}
+	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
 
-		if isPrimaryKey {
-			row[column.Name] = id
-		} else {
-			generator := dg.columnGenerators[column.Name]
-			row[column.Name] = generator()
+	// For integer single-column PK/UK, generate sequentially
+	for _, colSet := range keyCols {
+		if len(colSet) == 1 {
+			colName := colSet[0]
+			colType := ""
+			for _, c := range dg.tableDef.Columns {
+				if c.Name == colName {
+					colType = c.Type
+					break
+				}
+			}
+			if strings.Contains(colType, "int") {
+				row[colName] = id
+			} else if isStringType(colType) {
+				// For string unique columns, generate deterministic unique value
+				row[colName] = fmt.Sprintf("%s_%d", colName, id)
+			}
 		}
 	}
 
+	// Generate other columns
+	for _, column := range dg.tableDef.Columns {
+		if _, ok := row[column.Name]; ok {
+			continue // already set
+		}
+		generator := dg.columnGenerators[column.Name]
+		row[column.Name] = generator()
+	}
+
 	return row
+}
+
+// Helper to check if a type is a string type
+func isStringType(typ string) bool {
+	baseType := typ
+	if idx := strings.Index(baseType, "("); idx != -1 {
+		baseType = baseType[:idx]
+	}
+	baseType = strings.ToLower(baseType)
+	return baseType == "varchar" || baseType == "char" || baseType == "text"
 }
 
 func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
@@ -726,6 +757,12 @@ func (dg *DataGenerator) InsertDataToDBBenchmark(config DBConfig, tableName stri
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool for better performance
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
@@ -833,6 +870,12 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
+
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
 
 	// Configure connection pool for better performance
 	db.SetMaxOpenConns(10)
@@ -959,6 +1002,12 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool for better performance
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(5)
@@ -1065,6 +1114,12 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool for parallel operations
 	db.SetMaxOpenConns(numWorkers * 2)
 	db.SetMaxIdleConns(numWorkers)
@@ -1116,6 +1171,13 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 				return
 			}
 			defer workerDB.Close()
+
+			// Set session time zone to UTC
+			_, err = workerDB.Exec("SET time_zone = 'UTC'")
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
+				return
+			}
 
 			// Prepare statement for this worker
 			stmt, err := workerDB.Prepare(insertSQL)
@@ -1282,6 +1344,12 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool for parallel operations
 	db.SetMaxOpenConns(numWorkers * 2)
 	db.SetMaxIdleConns(numWorkers)
@@ -1328,6 +1396,13 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 				return
 			}
 			defer workerDB.Close()
+
+			// Set session time zone to UTC
+			_, err = workerDB.Exec("SET time_zone = 'UTC'")
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
+				return
+			}
 
 			// Process jobs
 			for startRow := range jobs {
@@ -1575,6 +1650,12 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool
 	db.SetMaxOpenConns(numWorkers * 2)
 	db.SetMaxIdleConns(numWorkers)
@@ -1601,6 +1682,75 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 	// Use smaller batch size for better progress reporting
 	batchSize := 100
 
+	// Track unique values for unique key columns across all workers
+	var uniqueMutex sync.Mutex
+	uniqueSets := make([]map[string]struct{}, 0)
+	keyCols := make([][]string, 0)
+	if len(dg.tableDef.PrimaryKey) > 0 {
+		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
+	}
+	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
+	for range keyCols {
+		uniqueSets = append(uniqueSets, make(map[string]struct{}))
+	}
+
+	// Pre-generate all rows with uniqueness check to avoid race conditions
+	allRows := make([][]interface{}, 0, numRows)
+	rowID := startID
+
+	for i := 0; i < numRows; i++ {
+		// Generate row with uniqueness check
+		var row TableRow
+		maxRetries := 100
+		for retry := 0; retry < maxRetries; retry++ {
+			row = dg.GenerateRow(rowID)
+
+			// Check uniqueness for unique key columns
+			uniqueMutex.Lock()
+			isUnique := true
+			for i, colSet := range keyCols {
+				key := ""
+				for _, col := range colSet {
+					key += fmt.Sprintf("|%v", row[col])
+				}
+				if _, exists := uniqueSets[i][key]; exists {
+					isUnique = false
+					break
+				}
+			}
+
+			if isUnique {
+				// Mark as used
+				for i, colSet := range keyCols {
+					key := ""
+					for _, col := range colSet {
+						key += fmt.Sprintf("|%v", row[col])
+					}
+					uniqueSets[i][key] = struct{}{}
+				}
+				uniqueMutex.Unlock()
+				break
+			}
+			uniqueMutex.Unlock()
+
+			if retry == maxRetries-1 {
+				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
+			}
+		}
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		values := make([]interface{}, 0, len(dg.tableDef.Columns))
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			values = append(values, row[column.Name])
+		}
+		allRows = append(allRows, values)
+		rowID++
+	}
+
 	// Create channels for coordination
 	jobs := make(chan int, numRows)
 	results := make(chan error, numWorkers)
@@ -1619,6 +1769,13 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 				return
 			}
 			defer workerDB.Close()
+
+			// Set session time zone to UTC
+			_, err = workerDB.Exec("SET time_zone = 'UTC'")
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
+				return
+			}
 
 			// Prepare statement for this worker
 			stmt, err := workerDB.Prepare(insertSQL)
@@ -1645,25 +1802,13 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 				// Prepare statement for this transaction
 				txStmt := tx.Stmt(stmt)
 
-				// Generate and insert rows for this batch
-				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(startID + rowID) // Use specified start ID
-
-					// Convert row to interface slice for query - skip auto-increment columns
-					values := make([]interface{}, 0, len(dg.tableDef.Columns))
-					for _, column := range dg.tableDef.Columns {
-						// Skip auto-increment columns
-						if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-							continue
-						}
-						values = append(values, row[column.Name])
-					}
-
+				// Insert pre-generated rows for this batch
+				for rowIdx := startRow; rowIdx < endRow; rowIdx++ {
 					// Execute insert
-					_, err := txStmt.Exec(values...)
+					_, err := txStmt.Exec(allRows[rowIdx]...)
 					if err != nil {
 						tx.Rollback()
-						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, startID+rowID, err)
+						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, startID+rowIdx, err)
 						return
 					}
 				}
@@ -1714,6 +1859,12 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 	}
 	defer db.Close()
 
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
 	// Configure connection pool
 	db.SetMaxOpenConns(numWorkers * 2)
 	db.SetMaxIdleConns(numWorkers)
@@ -1730,6 +1881,75 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 		}
 		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
 		placeholders = append(placeholders, "?")
+	}
+
+	// Track unique values for unique key columns across all workers
+	var uniqueMutex sync.Mutex
+	uniqueSets := make([]map[string]struct{}, 0)
+	keyCols := make([][]string, 0)
+	if len(dg.tableDef.PrimaryKey) > 0 {
+		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
+	}
+	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
+	for range keyCols {
+		uniqueSets = append(uniqueSets, make(map[string]struct{}))
+	}
+
+	// Pre-generate all rows with uniqueness check to avoid race conditions
+	allRows := make([][]interface{}, 0, numRows)
+	rowID := startID
+
+	for i := 0; i < numRows; i++ {
+		// Generate row with uniqueness check
+		var row TableRow
+		maxRetries := 100
+		for retry := 0; retry < maxRetries; retry++ {
+			row = dg.GenerateRow(rowID)
+
+			// Check uniqueness for unique key columns
+			uniqueMutex.Lock()
+			isUnique := true
+			for i, colSet := range keyCols {
+				key := ""
+				for _, col := range colSet {
+					key += fmt.Sprintf("|%v", row[col])
+				}
+				if _, exists := uniqueSets[i][key]; exists {
+					isUnique = false
+					break
+				}
+			}
+
+			if isUnique {
+				// Mark as used
+				for i, colSet := range keyCols {
+					key := ""
+					for _, col := range colSet {
+						key += fmt.Sprintf("|%v", row[col])
+					}
+					uniqueSets[i][key] = struct{}{}
+				}
+				uniqueMutex.Unlock()
+				break
+			}
+			uniqueMutex.Unlock()
+
+			if retry == maxRetries-1 {
+				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
+			}
+		}
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		values := make([]interface{}, 0, len(dg.tableDef.Columns))
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			values = append(values, row[column.Name])
+		}
+		allRows = append(allRows, values)
+		rowID++
 	}
 
 	// Use smaller batch size for better progress reporting
@@ -1754,6 +1974,13 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 			}
 			defer workerDB.Close()
 
+			// Set session time zone to UTC
+			_, err = workerDB.Exec("SET time_zone = 'UTC'")
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
+				return
+			}
+
 			// Process jobs
 			for startRow := range jobs {
 				endRow := startRow + batchSize
@@ -1765,18 +1992,9 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 				valueGroups := make([]string, 0, endRow-startRow)
 				allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
 
-				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(startID + rowID) // Use specified start ID
+				for rowIdx := startRow; rowIdx < endRow; rowIdx++ {
 					valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-
-					// Convert row to interface slice for query - skip auto-increment columns
-					for _, column := range dg.tableDef.Columns {
-						// Skip auto-increment columns
-						if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-							continue
-						}
-						allValues = append(allValues, row[column.Name])
-					}
+					allValues = append(allValues, allRows[rowIdx]...)
 				}
 
 				bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
