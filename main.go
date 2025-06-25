@@ -282,6 +282,15 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			}
 			return dg.rand.Intn(10000)
 		}
+	case "year":
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			// MySQL YEAR is 1901-2155, but for realism use 2000-2030
+			year := 2000 + dg.rand.Intn(31)
+			return year
+		}
 	case "varchar", "char", "text":
 		return func() interface{} {
 			if dg.rand.Float32() < float32(nullProbability) {
