@@ -979,12 +979,12 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 
 		elapsed := time.Since(startTime)
 		rate := float64(end) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
+		fmt.Fprintf(os.Stderr, "\rInserted %d rows... (%.0f rows/sec)", end, rate)
 	}
 
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
@@ -1082,12 +1082,12 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 
 		elapsed := time.Since(startTime)
 		rate := float64(end) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
+		fmt.Fprintf(os.Stderr, "\rInserted %d rows... (%.0f rows/sec)", end, rate)
 	}
 
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
@@ -1095,6 +1095,9 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 // Parallel insert method using multiple goroutines
 func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
+
+	var totalTime time.Duration
+	var totalRate float64
 
 	// Get the next available ID to avoid duplicate key errors
 	nextID, err := getNextAvailableID(config, dg.tableDef)
@@ -1271,7 +1274,7 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 				if completedRows > 0 && completedRows != lastReportedRows {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
-					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+					fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
 					lastReportedRows = completedRows
 				}
 			case <-done:
@@ -1293,6 +1296,8 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 					}
 				}
 				done <- true
+				totalTime = time.Since(startTime)
+				totalRate = float64(numRows) / totalTime.Seconds()
 				goto finished
 			}
 			completedRows += batchSize
@@ -1311,13 +1316,14 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 	if completedRows > 0 && completedRows != lastReportedRows {
 		elapsed := time.Since(startTime)
 		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+		fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
 	}
 
+	totalTime = time.Since(startTime)
+	totalRate = float64(numRows) / totalTime.Seconds()
+
 finished:
-	totalTime := time.Since(startTime)
-	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
@@ -1325,6 +1331,9 @@ finished:
 // Parallel bulk insert method
 func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
+
+	var totalTime time.Duration
+	var totalRate float64
 
 	// Get the next available ID to avoid duplicate key errors
 	nextID, err := getNextAvailableID(config, dg.tableDef)
@@ -1478,7 +1487,7 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 				if completedRows > 0 && completedRows != lastReportedRows {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
-					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+					fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
 					lastReportedRows = completedRows
 				}
 			case <-done:
@@ -1500,6 +1509,8 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 					}
 				}
 				done <- true
+				totalTime = time.Since(startTime)
+				totalRate = float64(numRows) / totalTime.Seconds()
 				goto finished
 			}
 			completedRows += batchSize
@@ -1518,13 +1529,14 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 	if completedRows > 0 && completedRows != lastReportedRows {
 		elapsed := time.Since(startTime)
 		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+		fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
 	}
 
+	totalTime = time.Since(startTime)
+	totalRate = float64(numRows) / totalTime.Seconds()
+
 finished:
-	totalTime := time.Since(startTime)
-	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
