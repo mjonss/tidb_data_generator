@@ -1571,7 +1571,7 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 			err = dg.insertBatchToRealTable(config, tableName, 100, workers, currentID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
-				break
+				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
 			}
 			rowsInserted += 100
 			currentID += 100 // Increment ID for next batch
@@ -1625,7 +1625,7 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 			err = dg.insertBatchToRealTableBulk(config, tableName, 100, workers, currentID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
-				break
+				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
 			}
 			rowsInserted += 100
 			currentID += 100 // Increment ID for next batch
