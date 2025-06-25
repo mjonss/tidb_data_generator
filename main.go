@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ func debugPrint(format string, args ...interface{}) {
 type ColumnDef struct {
 	Name     string
 	Type     string
+	Size     int // Maximum size/length for string columns
 	Nullable bool
 	Default  string
 	Extra    string
@@ -172,12 +174,18 @@ func parseCreateTable(sqlFile string) (*TableDef, error) {
 }
 
 func parseColumnDefinition(name, definition string) ColumnDef {
-	// Extract data type
-	typeRegex := regexp.MustCompile(`(\w+)(?:\([^)]*\))?`)
+	// Extract data type and size
+	typeRegex := regexp.MustCompile(`(\w+)(?:\((\d+)\))?`)
 	typeMatch := typeRegex.FindStringSubmatch(definition)
 	dataType := "varchar"
+	size := 0
 	if len(typeMatch) >= 2 {
 		dataType = strings.ToLower(typeMatch[1])
+		if len(typeMatch) >= 3 && typeMatch[2] != "" {
+			if sizeVal, err := strconv.Atoi(typeMatch[2]); err == nil {
+				size = sizeVal
+			}
+		}
 	}
 
 	// Check if nullable
@@ -200,6 +208,7 @@ func parseColumnDefinition(name, definition string) ColumnDef {
 	return ColumnDef{
 		Name:     name,
 		Type:     dataType,
+		Size:     size,
 		Nullable: nullable,
 		Default:  defaultValue,
 		Extra:    extra,
@@ -281,11 +290,15 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			// Try to use stats if available
 			if dg.stats != nil {
 				if _, exists := dg.stats.Columns[column.Name]; exists {
-					return dg.generateStringFromStats(column.Name)
+					return dg.generateStringFromStats(column)
 				}
 			}
-			// Fallback to random string
-			return fmt.Sprintf("value_%d", dg.rand.Intn(1000))
+			// Fallback to random string - respect column size
+			fallbackValue := fmt.Sprintf("value_%d", dg.rand.Intn(1000))
+			if column.Size > 0 && len(fallbackValue) > column.Size {
+				fallbackValue = fallbackValue[:column.Size]
+			}
+			return fallbackValue
 		}
 	case "timestamp", "datetime":
 		return func() interface{} {
@@ -338,8 +351,8 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 	}
 }
 
-func (dg *DataGenerator) generateStringFromStats(columnName string) string {
-	columnStats := dg.stats.Columns[columnName]
+func (dg *DataGenerator) generateStringFromStats(column ColumnDef) string {
+	columnStats := dg.stats.Columns[column.Name]
 	if columnStats.CMSketch != nil && len(columnStats.CMSketch.TopN) > 0 {
 		// Use frequency distribution from CMSketch
 		totalWeight := 0
@@ -361,6 +374,10 @@ func (dg *DataGenerator) generateStringFromStats(columnName string) string {
 					value = strings.ReplaceAll(value, "\x00", "")
 					value = strings.TrimSpace(value)
 					value = strings.ToValidUTF8(value, "")
+					// Truncate to column size if specified
+					if column.Size > 0 && len(value) > column.Size {
+						value = value[:column.Size]
+					}
 					return value
 				}
 				break
@@ -368,8 +385,12 @@ func (dg *DataGenerator) generateStringFromStats(columnName string) string {
 		}
 	}
 
-	// Fallback
-	return fmt.Sprintf("generated_%s_%d", columnName, dg.rand.Intn(1000))
+	// Fallback - generate string within size limit
+	fallbackValue := fmt.Sprintf("generated_%s_%d", column.Name, dg.rand.Intn(1000))
+	if column.Size > 0 && len(fallbackValue) > column.Size {
+		fallbackValue = fallbackValue[:column.Size]
+	}
+	return fallbackValue
 }
 
 func (dg *DataGenerator) generateTimeFromStats(columnName string) time.Time {
@@ -443,7 +464,18 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 				row[colName] = id
 			} else if isStringType(colType) {
 				// For string unique columns, generate deterministic unique value
-				row[colName] = fmt.Sprintf("%s_%d", colName, id)
+				uniqueValue := fmt.Sprintf("%s_%d", colName, id)
+				// Find the column to get its size
+				for _, c := range dg.tableDef.Columns {
+					if c.Name == colName {
+						// Truncate to column size if specified
+						if c.Size > 0 && len(uniqueValue) > c.Size {
+							uniqueValue = uniqueValue[:c.Size]
+						}
+						break
+					}
+				}
+				row[colName] = uniqueValue
 			}
 		}
 	}
@@ -499,6 +531,20 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 				}
 				if strings.Contains(colType, "int") {
 					row[colName] = nextInt
+				} else if isStringType(colType) {
+					// For string unique columns, generate deterministic unique value
+					uniqueValue := fmt.Sprintf("%s_%d", colName, nextInt)
+					// Find the column to get its size
+					for _, c := range dg.tableDef.Columns {
+						if c.Name == colName {
+							// Truncate to column size if specified
+							if c.Size > 0 && len(uniqueValue) > c.Size {
+								uniqueValue = uniqueValue[:c.Size]
+							}
+							break
+						}
+					}
+					row[colName] = uniqueValue
 				}
 			}
 		}
@@ -609,9 +655,14 @@ func parseTableFromDB(config DBConfig, tableName string) (*TableDef, error) {
 		column := ColumnDef{
 			Name:     columnName,
 			Type:     dataTypeLower,
+			Size:     0, // Default to 0 for non-string columns
 			Nullable: isNullable == "YES",
 			Default:  defaultValue.String,
 			Extra:    extra,
+		}
+		// Set size for string columns
+		if charLength.Valid {
+			column.Size = int(charLength.Int64)
 		}
 		columns = append(columns, column)
 	}
