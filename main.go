@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"regexp"
@@ -463,6 +462,43 @@ func base36(n int) string {
 	return res
 }
 
+// Helper: get min/max for MySQL integer types
+func getIntTypeRange(typ string) (min, max int64) {
+	baseType := typ
+	if idx := strings.Index(baseType, "("); idx != -1 {
+		baseType = baseType[:idx]
+	}
+	switch strings.ToLower(baseType) {
+	case "tinyint":
+		return -128, 127
+	case "smallint":
+		return -32768, 32767
+	case "mediumint":
+		return -8388608, 8388607
+	case "int", "integer":
+		return -2147483648, 2147483647
+	case "bigint":
+		return -9223372036854775808, 9223372036854775807
+	default:
+		return -2147483648, 2147483647 // default to int
+	}
+}
+
+// Helper: generate unique values for composite key columns using mixed-radix counting
+func generateCompositeKeyValues(id int, colTypes []string, colMins, colRanges []int64) []int64 {
+	vals := make([]int64, len(colTypes))
+	remainder := int64(id)
+	for i := len(colTypes) - 1; i >= 0; i-- {
+		if colRanges[i] > 0 {
+			vals[i] = colMins[i] + (remainder % colRanges[i])
+			remainder = remainder / colRanges[i]
+		} else {
+			vals[i] = colMins[i]
+		}
+	}
+	return vals
+}
+
 func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	row := make(TableRow)
 
@@ -477,7 +513,6 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 
 	for _, colSet := range keyCols {
 		if len(colSet) == 1 {
-			// Single-column key: use existing logic
 			colName := colSet[0]
 			colType := ""
 			colSize := 0
@@ -489,7 +524,15 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 				}
 			}
 			if strings.Contains(colType, "int") {
-				row[colName] = id
+				min, max := getIntTypeRange(colType)
+				val := int64(id)
+				if max > min {
+					rangeSize := max - min + 1
+					if rangeSize > 0 {
+						val = min + (val % rangeSize)
+					}
+				}
+				row[colName] = val
 			} else if isStringType(colType) {
 				val := base36(id)
 				if colSize > 0 && len(val) > colSize {
@@ -499,50 +542,41 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 			}
 			usedCols[colName] = true
 		} else if len(colSet) > 1 {
-			// Composite key: generate unique tuple
-			// Compute the number of possible values for each column
-			cardinalities := make([]int, len(colSet))
+			// Mixed-radix for composite keys
+			colTypes := make([]string, len(colSet))
+			colMins := make([]int64, len(colSet))
+			colRanges := make([]int64, len(colSet))
+			colSizes := make([]int, len(colSet))
 			for i, colName := range colSet {
 				for _, c := range dg.tableDef.Columns {
 					if c.Name == colName {
+						colTypes[i] = c.Type
+						colSizes[i] = c.Size
 						if strings.Contains(c.Type, "int") {
-							cardinalities[i] = math.MaxInt32 // effectively unlimited
-						} else if isStringType(c.Type) {
-							// For string, cardinality is 36^size (base36)
-							if c.Size > 0 {
-								cardinalities[i] = int(math.Pow(36, float64(c.Size)))
-							} else {
-								cardinalities[i] = math.MaxInt32
-							}
+							min, max := getIntTypeRange(c.Type)
+							colMins[i] = min
+							colRanges[i] = max - min + 1
 						} else {
-							cardinalities[i] = math.MaxInt32
+							colMins[i] = 0
+							colRanges[i] = 0
 						}
 						break
 					}
 				}
 			}
-			// Mixed-radix decomposition of id
-			n := id
+			vals := generateCompositeKeyValues(id, colTypes, colMins, colRanges)
 			for i, colName := range colSet {
-				var val interface{}
-				for _, c := range dg.tableDef.Columns {
-					if c.Name == colName {
-						if strings.Contains(c.Type, "int") {
-							val = n % cardinalities[i]
-						} else if isStringType(c.Type) {
-							strVal := base36(n % cardinalities[i])
-							if c.Size > 0 && len(strVal) > c.Size {
-								strVal = strVal[:c.Size]
-							}
-							val = strVal
-						} else {
-							val = n % cardinalities[i]
-						}
-						break
+				if strings.Contains(colTypes[i], "int") {
+					row[colName] = vals[i]
+				} else if isStringType(colTypes[i]) {
+					val := base36(int(vals[i]))
+					if colSizes[i] > 0 && len(val) > colSizes[i] {
+						val = val[:colSizes[i]]
 					}
+					row[colName] = val
+				} else {
+					row[colName] = vals[i]
 				}
-				row[colName] = val
-				n /= cardinalities[i]
 				usedCols[colName] = true
 			}
 		}
@@ -560,9 +594,94 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	return row
 }
 
+// Helper: extract representative values for a column from stats
+func (dg *DataGenerator) getColumnValueSet(colName string, max int) []interface{} {
+	if dg.stats == nil {
+		return nil
+	}
+	colStats, ok := dg.stats.Columns[colName]
+	if !ok {
+		return nil
+	}
+	values := []interface{}{}
+	// Use TopN if available
+	if colStats.CMSketch != nil && len(colStats.CMSketch.TopN) > 0 {
+		for _, item := range colStats.CMSketch.TopN {
+			decoded, err := base64.StdEncoding.DecodeString(item.Data)
+			if err == nil && len(decoded) > 1 {
+				val := string(decoded[1:])
+				val = strings.ReplaceAll(val, "\x00", "")
+				val = strings.TrimSpace(val)
+				val = strings.ToValidUTF8(val, "")
+				values = append(values, val)
+				if len(values) >= max {
+					return values
+				}
+			}
+		}
+	}
+	// Use histogram buckets if available
+	if colStats.Histogram != nil && len(colStats.Histogram.Buckets) > 0 {
+		for _, bucket := range colStats.Histogram.Buckets {
+			// Use lower_bound as a representative value
+			decoded, err := base64.StdEncoding.DecodeString(bucket.LowerBound)
+			if err == nil {
+				val := string(decoded)
+				val = strings.ReplaceAll(val, "\x00", "")
+				val = strings.TrimSpace(val)
+				val = strings.ToValidUTF8(val, "")
+				values = append(values, val)
+				if len(values) >= max {
+					return values
+				}
+			}
+		}
+	}
+	// Use NDV to generate synthetic values if needed
+	if colStats.Histogram != nil && colStats.Histogram.NDV > 0 && len(values) < max {
+		for i := len(values); i < max && i < colStats.Histogram.NDV; i++ {
+			values = append(values, fmt.Sprintf("%s_%d", colName, i))
+		}
+	}
+	return values
+}
+
+// Generate unique combinations for composite keys using stats
+func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numRows int) [][]interface{} {
+	valueSets := make([][]interface{}, len(keyCols))
+	for i, col := range keyCols {
+		valueSets[i] = dg.getColumnValueSet(col, numRows)
+		if len(valueSets[i]) == 0 {
+			// Fallback: generate synthetic values
+			for j := 0; j < numRows; j++ {
+				valueSets[i] = append(valueSets[i], fmt.Sprintf("%s_%d", col, j))
+			}
+		}
+	}
+	// Generate cartesian product up to numRows
+	combos := [][]interface{}{}
+	var generate func(idx int, current []interface{})
+	generate = func(idx int, current []interface{}) {
+		if len(combos) >= numRows {
+			return
+		}
+		if idx == len(valueSets) {
+			combo := make([]interface{}, len(current))
+			copy(combo, current)
+			combos = append(combos, combo)
+			return
+		}
+		for _, v := range valueSets[idx] {
+			generate(idx+1, append(current, v))
+		}
+	}
+	generate(0, []interface{}{})
+	return combos
+}
+
+// Update GenerateData to use composite key combos from stats
 func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 	rows := make([]TableRow, 0, numRows)
-	// Track unique values for all unique/primary key columns/tuples
 	uniqueSets := make([]map[string]struct{}, 0)
 	keyCols := make([][]string, 0)
 	if len(dg.tableDef.PrimaryKey) > 0 {
@@ -573,10 +692,19 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 		uniqueSets = append(uniqueSets, make(map[string]struct{}))
 	}
 
+	// Precompute composite key combos if possible
+	compositeCombos := map[string][][]interface{}{}
+	for _, colSet := range keyCols {
+		if len(colSet) > 1 {
+			combos := dg.generateCompositeKeyCombinations(colSet, numRows)
+			compositeCombos[strings.Join(colSet, ",")] = combos
+		}
+	}
+
 	nextInt := 1
+	comboIdx := map[string]int{}
 	for len(rows) < numRows {
 		row := make(TableRow)
-		// For integer single-column PK/UK, generate sequentially
 		for _, colSet := range keyCols {
 			if len(colSet) == 1 {
 				colName := colSet[0]
@@ -592,30 +720,24 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 				if strings.Contains(colType, "int") {
 					row[colName] = nextInt
 				} else if isStringType(colType) {
-					// For string unique columns, generate deterministic unique value
-					// Use a more compact format for small column sizes
 					var uniqueValue string
 					if colSize > 0 && colSize < 5 {
-						// For very small columns, use just a single character + number
 						uniqueValue = fmt.Sprintf("%c%d", 'A'+(nextInt%26), nextInt)
 						if len(uniqueValue) > colSize {
 							uniqueValue = uniqueValue[:colSize]
 						}
 					} else if colSize > 0 && colSize < 10 {
-						// For very small columns, use just numbers
 						uniqueValue = fmt.Sprintf("%d", nextInt)
 						if len(uniqueValue) > colSize {
 							uniqueValue = uniqueValue[:colSize]
 						}
 					} else if colSize > 0 && colSize < 20 {
-						// For small columns, use short prefix + number
 						prefix := colName[:min(3, len(colName))]
 						uniqueValue = fmt.Sprintf("%s%d", prefix, nextInt)
 						if len(uniqueValue) > colSize {
 							uniqueValue = uniqueValue[:colSize]
 						}
 					} else {
-						// For larger columns, use full format
 						uniqueValue = fmt.Sprintf("%s_%d", colName, nextInt)
 						if colSize > 0 && len(uniqueValue) > colSize {
 							uniqueValue = uniqueValue[:colSize]
@@ -623,17 +745,26 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 					}
 					row[colName] = uniqueValue
 				}
+			} else if len(colSet) > 1 {
+				key := strings.Join(colSet, ",")
+				combos := compositeCombos[key]
+				idx := comboIdx[key]
+				if idx >= len(combos) {
+					continue // exhausted combos
+				}
+				for i, colName := range colSet {
+					row[colName] = combos[idx][i]
+				}
+				comboIdx[key] = idx + 1
 			}
 		}
-		// Generate other columns
 		for _, column := range dg.tableDef.Columns {
 			if _, ok := row[column.Name]; ok {
-				continue // already set
+				continue
 			}
 			generator := dg.columnGenerators[column.Name]
 			row[column.Name] = generator()
 		}
-		// Check uniqueness
 		isUnique := true
 		for i, colSet := range keyCols {
 			key := ""
@@ -656,7 +787,6 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 			rows = append(rows, row)
 			nextInt++
 		}
-		// else: retry
 	}
 	return rows
 }
@@ -825,10 +955,73 @@ func NewDataGeneratorFromTableDef(tableDef *TableDef, statsFile string) (*DataGe
 	return generator, nil
 }
 
+// Get the next available values for composite primary keys
+func getNextAvailableCompositeKey(config DBConfig, tableDef *TableDef) (map[string]int, error) {
+	if len(tableDef.PrimaryKey) == 0 {
+		return nil, nil
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Set session time zone to UTC
+	_, err = db.Exec("SET time_zone = 'UTC'")
+	if err != nil {
+		return nil, fmt.Errorf("failed to set session time_zone: %w", err)
+	}
+
+	// Build query to get max values for all primary key columns
+	maxQueries := make([]string, len(tableDef.PrimaryKey))
+	for i, pkCol := range tableDef.PrimaryKey {
+		maxQueries[i] = fmt.Sprintf("MAX(`%s`)", pkCol)
+	}
+	query := fmt.Sprintf("SELECT %s FROM `%s`", strings.Join(maxQueries, ", "), tableDef.Name)
+
+	// Execute query
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query max values: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil, fmt.Errorf("no rows returned from max query")
+	}
+
+	// Scan results
+	values := make([]sql.NullInt64, len(tableDef.PrimaryKey))
+	valuePtrs := make([]interface{}, len(tableDef.PrimaryKey))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	if err := rows.Scan(valuePtrs...); err != nil {
+		return nil, fmt.Errorf("failed to scan max values: %w", err)
+	}
+
+	// Build result map
+	result := make(map[string]int)
+	for i, pkCol := range tableDef.PrimaryKey {
+		if values[i].Valid {
+			result[pkCol] = int(values[i].Int64) + 1
+		} else {
+			result[pkCol] = 1
+		}
+	}
+
+	return result, nil
+}
+
 // Get the next available value for a single-column integer primary key
 func getNextAvailableID(config DBConfig, tableDef *TableDef) (int, error) {
 	if len(tableDef.PrimaryKey) != 1 {
-		// Only support single-column PK for now
+		// For composite keys, return 1 and let the composite key logic handle it
 		debugPrint("[DEBUG] getNextAvailableID: not a single-column PK\n")
 		return 1, nil
 	}
@@ -872,118 +1065,36 @@ func getNextAvailableID(config DBConfig, tableDef *TableDef) (int, error) {
 	return 1, nil
 }
 
-// Simplified insert method for benchmarking (no progress output)
-func (dg *DataGenerator) InsertDataToDBBenchmark(config DBConfig, tableName string, numRows int) error {
-	// Create DSN (Data Source Name) with performance optimizations
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-
-	// Connect to database
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+// Helper to check if a type is a string type
+func isStringType(typ string) bool {
+	baseType := typ
+	if idx := strings.Index(baseType, "("); idx != -1 {
+		baseType = baseType[:idx]
 	}
-	defer db.Close()
+	baseType = strings.ToLower(baseType)
+	return baseType == "varchar" || baseType == "char" || baseType == "text"
+}
 
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
-
-	// Configure connection pool for better performance
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
-
-	// Test connection
-	if err := db.Ping(); err != nil {
-		return fmt.Errorf("failed to ping database: %w", err)
+// Helper function to get effective number of rows
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int) int {
+	// If command line specified rows, use that
+	if commandLineRows > 0 {
+		if maxRows > 0 && commandLineRows > maxRows {
+			return maxRows
+		}
+		return commandLineRows
 	}
 
-	// Build INSERT statement - skip auto-increment columns
-	columnNames := make([]string, 0, len(dg.tableDef.Columns))
-	placeholders := make([]string, 0, len(dg.tableDef.Columns))
-
-	for _, column := range dg.tableDef.Columns {
-		// Skip auto-increment columns
-		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-			continue
+	// Otherwise, use count from stats file
+	if generator.stats != nil && generator.stats.Count > 0 {
+		if maxRows > 0 && generator.stats.Count > maxRows {
+			return maxRows
 		}
-		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
-		placeholders = append(placeholders, "?")
+		return generator.stats.Count
 	}
 
-	insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columnNames, ", "),
-		strings.Join(placeholders, ", "))
-
-	// Get the next available ID to avoid duplicate key errors
-	nextID, err := getNextAvailableID(config, dg.tableDef)
-	if err != nil {
-		return fmt.Errorf("failed to get next available ID: %w", err)
-	}
-
-	// Use larger batch size for better performance
-	batchSize := 5000
-
-	// Generate and insert data in batches
-	for i := 0; i < numRows; i += batchSize {
-		end := i + batchSize
-		if end > numRows {
-			end = numRows
-		}
-
-		// Start transaction for batch
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("failed to begin transaction: %w", err)
-		}
-
-		// Prepare statement for this transaction
-		stmt, err := tx.Prepare(insertSQL)
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to prepare statement: %w", err)
-		}
-
-		// Generate all rows for this batch first
-		rows := make([][]interface{}, 0, end-i)
-		for j := i; j < end; j++ {
-			row := dg.GenerateRow(nextID + j)
-
-			// Convert row to interface slice for query - skip auto-increment columns
-			values := make([]interface{}, 0, len(dg.tableDef.Columns))
-			for _, column := range dg.tableDef.Columns {
-				// Skip auto-increment columns
-				if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-					continue
-				}
-				values = append(values, row[column.Name])
-			}
-			rows = append(rows, values)
-		}
-
-		// Execute all inserts in this batch
-		for _, values := range rows {
-			_, err := stmt.Exec(values...)
-			if err != nil {
-				stmt.Close()
-				tx.Rollback()
-				return fmt.Errorf("failed to insert row: %w", err)
-			}
-		}
-
-		stmt.Close()
-
-		// Commit transaction
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("failed to commit transaction: %w", err)
-		}
-	}
-
-	return nil
+	// Fallback
+	return 1000
 }
 
 // Standard insert method (non-parallel)
@@ -998,12 +1109,6 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
 
 	// Configure connection pool for better performance
 	db.SetMaxOpenConns(10)
@@ -1107,12 +1212,12 @@ func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRo
 
 		elapsed := time.Since(startTime)
 		rate := float64(end) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "\rInserted %d rows... (%.0f rows/sec)", end, rate)
+		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
 	}
 
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
@@ -1129,12 +1234,6 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
 
 	// Configure connection pool for better performance
 	db.SetMaxOpenConns(10)
@@ -1210,33 +1309,104 @@ func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, n
 
 		elapsed := time.Since(startTime)
 		rate := float64(end) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "\rInserted %d rows... (%.0f rows/sec)", end, rate)
+		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", end, rate)
 	}
 
 	totalTime := time.Since(startTime)
 	totalRate := float64(numRows) / totalTime.Seconds()
-	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
+}
+
+// Generate row with composite key handling
+func (dg *DataGenerator) GenerateRowWithCompositeKey(id int, nextCompositeKeys map[string]int) TableRow {
+	row := make(TableRow)
+
+	// Set composite primary key values
+	if len(dg.tableDef.PrimaryKey) > 1 {
+		// For composite keys, we need to generate unique combinations
+		// Use the id to generate different combinations
+		for i, pkCol := range dg.tableDef.PrimaryKey {
+			var colType string
+			var colSize int
+			for _, c := range dg.tableDef.Columns {
+				if c.Name == pkCol {
+					colType = c.Type
+					colSize = c.Size
+					break
+				}
+			}
+
+			if strings.Contains(colType, "int") {
+				min, max := getIntTypeRange(colType)
+				// Use the next available value plus offset for uniqueness
+				baseValue := int64(nextCompositeKeys[pkCol])
+				val := baseValue + int64(id) + int64(i*1000000) // Add offset to ensure uniqueness
+				if max > min {
+					rangeSize := max - min + 1
+					if rangeSize > 0 {
+						val = min + (val % rangeSize)
+					}
+				}
+				row[pkCol] = val
+			} else if isStringType(colType) {
+				val := base36(id + i*1000000)
+				if colSize > 0 && len(val) > colSize {
+					val = val[:colSize]
+				}
+				row[pkCol] = val
+			}
+		}
+	}
+
+	// Generate other columns
+	for _, column := range dg.tableDef.Columns {
+		if _, ok := row[column.Name]; ok {
+			continue // already set
+		}
+		generator := dg.columnGenerators[column.Name]
+		row[column.Name] = generator()
+	}
+
+	return row
 }
 
 // Parallel insert method using multiple goroutines
 func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
 	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
 
-	var totalTime time.Duration
-	var totalRate float64
+	// Get the next available values for primary keys
+	var nextID int
+	var nextCompositeKeys map[string]int
+	var err error
 
-	// Get the next available ID to avoid duplicate key errors
-	nextID, err := getNextAvailableID(config, dg.tableDef)
-	if err != nil {
-		return fmt.Errorf("failed to get next available ID: %w", err)
+	if len(dg.tableDef.PrimaryKey) == 1 {
+		// Single-column primary key
+		nextID, err = getNextAvailableID(config, dg.tableDef)
+		if err != nil {
+			return fmt.Errorf("failed to get next available ID: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+	} else if len(dg.tableDef.PrimaryKey) > 1 {
+		// Composite primary key
+		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+		if err != nil {
+			return fmt.Errorf("failed to get next available composite key: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+		nextID = 1 // Use 1 as base for generating unique combinations
+	} else {
+		// No primary key, start from 1
+		nextID = 1
+		fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
 	}
-	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
 
 	// Create DSN (Data Source Name) with performance optimizations
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	debugPrint("[DEBUG] InsertDataToDBParallel DSN: %s\n", dsn)
 
 	// Connect to database
 	db, err := sql.Open("mysql", dsn)
@@ -1244,12 +1414,6 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
 
 	// Configure connection pool for parallel operations
 	db.SetMaxOpenConns(numWorkers * 2)
@@ -1303,13 +1467,6 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 			}
 			defer workerDB.Close()
 
-			// Set session time zone to UTC
-			_, err = workerDB.Exec("SET time_zone = 'UTC'")
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
-				return
-			}
-
 			// Prepare statement for this worker
 			stmt, err := workerDB.Prepare(insertSQL)
 			if err != nil {
@@ -1337,7 +1494,18 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 
 				// Generate and insert rows for this batch
 				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(nextID + rowID)
+					// Generate row with proper ID handling
+					var row TableRow
+					if len(dg.tableDef.PrimaryKey) == 1 {
+						// Single-column primary key
+						row = dg.GenerateRow(nextID + rowID)
+					} else if len(dg.tableDef.PrimaryKey) > 1 {
+						// Composite primary key - generate with offset
+						row = dg.GenerateRowWithCompositeKey(nextID+rowID, nextCompositeKeys)
+					} else {
+						// No primary key
+						row = dg.GenerateRow(nextID + rowID)
+					}
 
 					// Convert row to interface slice for query - skip auto-increment columns
 					values := make([]interface{}, 0, len(dg.tableDef.Columns))
@@ -1387,7 +1555,6 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 
 	// Monitor progress and collect errors
 	completedRows := 0
-	lastReportedRows := 0
 	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
 	defer progressTicker.Stop()
 
@@ -1399,11 +1566,10 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		for {
 			select {
 			case <-progressTicker.C:
-				if completedRows > 0 && completedRows != lastReportedRows {
+				if completedRows > 0 {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
-					fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
-					lastReportedRows = completedRows
+					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
 				}
 			case <-done:
 				return
@@ -1424,8 +1590,6 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 					}
 				}
 				done <- true
-				totalTime = time.Since(startTime)
-				totalRate = float64(numRows) / totalTime.Seconds()
 				goto finished
 			}
 			completedRows += batchSize
@@ -1440,36 +1604,63 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		}
 	}
 
-	// Final progress report
-	if completedRows > 0 && completedRows != lastReportedRows {
-		elapsed := time.Since(startTime)
-		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
-	}
-
-	totalTime = time.Since(startTime)
-	totalRate = float64(numRows) / totalTime.Seconds()
-
 finished:
-	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
 
-// Parallel bulk insert method
-func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
+// Simple benchmark insert function that uses an existing database connection
+func (dg *DataGenerator) benchmarkInsertWithDB(db *sql.DB, tableName string, numRows int, startID int) error {
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
 
-	var totalTime time.Duration
-	var totalRate float64
-
-	// Get the next available ID to avoid duplicate key errors
-	nextID, err := getNextAvailableID(config, dg.tableDef)
-	if err != nil {
-		return fmt.Errorf("failed to get next available ID: %w", err)
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
 	}
-	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
 
+	// Build bulk INSERT statement
+	valueGroups := make([]string, 0, numRows)
+	allValues := make([]interface{}, 0, numRows*len(placeholders))
+
+	for i := 0; i < numRows; i++ {
+		row := dg.GenerateRow(startID + i)
+		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			allValues = append(allValues, row[column.Name])
+		}
+	}
+
+	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(valueGroups, ", "))
+
+	// Execute bulk insert
+	_, err := db.Exec(bulkInsertSQL, allValues...)
+	if err != nil {
+		return fmt.Errorf("failed to execute bulk insert: %w", err)
+	}
+
+	return nil
+}
+
+// Simple benchmark bulk insert function that uses a specific start ID
+func (dg *DataGenerator) benchmarkBulkInsert(config DBConfig, tableName string, numRows int, startID int) error {
 	// Create DSN (Data Source Name) with performance optimizations
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -1481,11 +1672,120 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 	}
 	defer db.Close()
 
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
+	// Configure connection pool for benchmarking (use fewer connections)
+	db.SetMaxOpenConns(2)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(time.Minute * 5)
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		return fmt.Errorf("failed to ping database: %w", err)
 	}
+
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(placeholders, ", "))
+
+	// Start transaction
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Prepare statement for this transaction
+	stmt, err := tx.Prepare(insertSQL)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to prepare statement: %w", err)
+	}
+
+	// Generate and insert rows
+	for i := 0; i < numRows; i++ {
+		row := dg.GenerateRow(startID + i)
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		values := make([]interface{}, 0, len(dg.tableDef.Columns))
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			values = append(values, row[column.Name])
+		}
+
+		// Execute insert
+		_, err := stmt.Exec(values...)
+		if err != nil {
+			stmt.Close()
+			tx.Rollback()
+			return fmt.Errorf("failed to insert row: %w", err)
+		}
+	}
+
+	stmt.Close()
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// Parallel bulk insert method
+func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
+	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
+
+	// Get the next available values for primary keys
+	var nextID int
+	var nextCompositeKeys map[string]int
+	var err error
+
+	if len(dg.tableDef.PrimaryKey) == 1 {
+		// Single-column primary key
+		nextID, err = getNextAvailableID(config, dg.tableDef)
+		if err != nil {
+			return fmt.Errorf("failed to get next available ID: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+	} else if len(dg.tableDef.PrimaryKey) > 1 {
+		// Composite primary key
+		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+		if err != nil {
+			return fmt.Errorf("failed to get next available composite key: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+		nextID = 1 // Use 1 as base for generating unique combinations
+	} else {
+		// No primary key, start from 1
+		nextID = 1
+		fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
+	}
+
+	// Create DSN (Data Source Name) with performance optimizations
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Connect to database
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
 
 	// Configure connection pool for parallel operations
 	db.SetMaxOpenConns(numWorkers * 2)
@@ -1534,13 +1834,6 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 			}
 			defer workerDB.Close()
 
-			// Set session time zone to UTC
-			_, err = workerDB.Exec("SET time_zone = 'UTC'")
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
-				return
-			}
-
 			// Process jobs
 			for startRow := range jobs {
 				endRow := startRow + batchSize
@@ -1553,7 +1846,19 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 				allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
 
 				for rowID := startRow; rowID < endRow; rowID++ {
-					row := dg.GenerateRow(nextID + rowID)
+					// Generate row with proper ID handling
+					var row TableRow
+					if len(dg.tableDef.PrimaryKey) == 1 {
+						// Single-column primary key
+						row = dg.GenerateRow(nextID + rowID)
+					} else if len(dg.tableDef.PrimaryKey) > 1 {
+						// Composite primary key - generate with offset
+						row = dg.GenerateRowWithCompositeKey(nextID+rowID, nextCompositeKeys)
+					} else {
+						// No primary key
+						row = dg.GenerateRow(nextID + rowID)
+					}
+
 					valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
 
 					// Convert row to interface slice for query - skip auto-increment columns
@@ -1598,9 +1903,9 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		close(results)
 		close(progress)
 	}()
+
 	// Monitor progress and collect errors
 	completedRows := 0
-	lastReportedRows := 0
 	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
 	defer progressTicker.Stop()
 
@@ -1612,11 +1917,10 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		for {
 			select {
 			case <-progressTicker.C:
-				if completedRows > 0 && completedRows != lastReportedRows {
+				if completedRows > 0 {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
-					fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
-					lastReportedRows = completedRows
+					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
 				}
 			case <-done:
 				return
@@ -1637,8 +1941,6 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 					}
 				}
 				done <- true
-				totalTime = time.Since(startTime)
-				totalRate = float64(numRows) / totalTime.Seconds()
 				goto finished
 			}
 			completedRows += batchSize
@@ -1653,18 +1955,10 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		}
 	}
 
-	// Final progress report
-	if completedRows > 0 && completedRows != lastReportedRows {
-		elapsed := time.Since(startTime)
-		rate := float64(completedRows) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec)", completedRows, rate)
-	}
-
-	totalTime = time.Since(startTime)
-	totalRate = float64(numRows) / totalTime.Seconds()
-
 finished:
-	fmt.Fprintf(os.Stderr, "\nSuccessfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+	totalTime := time.Since(startTime)
+	totalRate := float64(numRows) / totalTime.Seconds()
+	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
 	return nil
 }
@@ -1674,40 +1968,74 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 	fmt.Fprintf(os.Stderr, "Auto-tuning parallel insert for %d rows...\n", numRows)
 
 	benchmarkDuration := 2 * time.Second
-	maxWorkers := 512 // Restored to 512 for very large machines
+	maxWorkers := 8 // Reduced from 16 to avoid port exhaustion
 	bestWorkers := 1
 	bestPerformance := 0.0
 
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
-
-		startTime := time.Now()
-		stopTime := startTime.Add(benchmarkDuration)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 		rowsInserted := 0
+		stopTime := time.Now().Add(benchmarkDuration)
 
-		for time.Now().Before(stopTime) {
-			// Insert a batch of 100 rows using the normal insert logic
-			err := dg.InsertDataToDBParallel(config, tableName, 100, workers)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
-				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
-			}
-			rowsInserted += 100
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+
+				// Create a single connection per worker
+				dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+					config.User, config.Password, config.Host, config.Port, config.Database)
+
+				db, err := sql.Open("mysql", dsn)
+				if err != nil {
+					debugPrint("[DEBUG] Worker %d failed to connect: %v\n", workerID, err)
+					return
+				}
+				defer db.Close()
+
+				// Configure connection pool for benchmarking (use minimal connections)
+				db.SetMaxOpenConns(1)
+				db.SetMaxIdleConns(1)
+				db.SetConnMaxLifetime(time.Minute * 2)
+
+				// Test connection
+				if err := db.Ping(); err != nil {
+					debugPrint("[DEBUG] Worker %d failed to ping: %v\n", workerID, err)
+					return
+				}
+
+				batchSize := 100
+				// Use different ID range for each worker to avoid conflicts
+				// SMALLINT range is -32,768 to 32,767, so use smaller increments
+				startID := workerID * 1000
+				for {
+					if time.Now().After(stopTime) {
+						return
+					}
+					// Use a simple benchmark insert that doesn't conflict
+					if err := dg.benchmarkInsertWithDB(db, tableName, batchSize, startID); err != nil {
+						// Just log the error and continue for benchmarking
+						debugPrint("[DEBUG] Worker %d benchmark insert error: %v\n", workerID, err)
+					}
+					mu.Lock()
+					rowsInserted += batchSize
+					mu.Unlock()
+					startID += batchSize
+				}
+			}(w)
 		}
-
-		elapsed := time.Since(startTime)
-		performance := float64(rowsInserted) / elapsed.Seconds()
+		wg.Wait()
+		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
 		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
-
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
 		} else if workers > 1 && performance < bestPerformance*0.8 {
-			// Performance is degrading significantly, stop testing
 			break
 		}
 	}
-
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
 	fmt.Fprintf(os.Stderr, "Inserting %d rows with %d workers...\n", numRows, bestWorkers)
 	return dg.InsertDataToDBParallel(config, tableName, numRows, bestWorkers)
@@ -1718,573 +2046,91 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 	fmt.Fprintf(os.Stderr, "Auto-tuning parallel bulk insert for %d rows...\n", numRows)
 
 	benchmarkDuration := 2 * time.Second
-	maxWorkers := 512 // Restored to 512 for very large machines
+	maxWorkers := 8 // Reduced from 16 to avoid port exhaustion
 	bestWorkers := 1
 	bestPerformance := 0.0
 
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
-
-		startTime := time.Now()
-		stopTime := startTime.Add(benchmarkDuration)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
 		rowsInserted := 0
+		stopTime := time.Now().Add(benchmarkDuration)
 
-		for time.Now().Before(stopTime) {
-			// Insert a batch of 100 rows using the normal bulk insert logic
-			err := dg.InsertDataToDBBulkParallel(config, tableName, 100, workers)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
-				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
-			}
-			rowsInserted += 100
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+
+				// Create a single connection per worker
+				dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+					config.User, config.Password, config.Host, config.Port, config.Database)
+
+				db, err := sql.Open("mysql", dsn)
+				if err != nil {
+					debugPrint("[DEBUG] Worker %d failed to connect: %v\n", workerID, err)
+					return
+				}
+				defer db.Close()
+
+				// Configure connection pool for benchmarking (use minimal connections)
+				db.SetMaxOpenConns(1)
+				db.SetMaxIdleConns(1)
+				db.SetConnMaxLifetime(time.Minute * 2)
+
+				// Test connection
+				if err := db.Ping(); err != nil {
+					debugPrint("[DEBUG] Worker %d failed to ping: %v\n", workerID, err)
+					return
+				}
+
+				batchSize := 100
+				// Use different ID range for each worker to avoid conflicts
+				// SMALLINT range is -32,768 to 32,767, so use smaller increments
+				startID := workerID * 1000
+				for {
+					if time.Now().After(stopTime) {
+						return
+					}
+					// Use a simple benchmark bulk insert that doesn't conflict
+					if err := dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID); err != nil {
+						// Just log the error and continue for benchmarking
+						debugPrint("[DEBUG] Worker %d benchmark bulk insert error: %v\n", workerID, err)
+					}
+					mu.Lock()
+					rowsInserted += batchSize
+					mu.Unlock()
+					startID += batchSize
+				}
+			}(w)
 		}
-
-		elapsed := time.Since(startTime)
-		performance := float64(rowsInserted) / elapsed.Seconds()
+		wg.Wait()
+		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
 		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
-
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
 		} else if workers > 1 && performance < bestPerformance*0.8 {
-			// Performance is degrading significantly, stop testing
 			break
 		}
 	}
-
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
 	fmt.Fprintf(os.Stderr, "Inserting %d rows with %d workers...\n", numRows, bestWorkers)
 	return dg.InsertDataToDBBulkParallel(config, tableName, numRows, bestWorkers)
-}
-
-// Simple method to insert a batch to temporary table (for benchmarking)
-func (dg *DataGenerator) insertBatchToTempTable(config DBConfig, tableName string, numRows int, numWorkers int) error {
-	// Create DSN
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-
-	// Connect to database
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
-
-	// Configure connection pool
-	db.SetMaxOpenConns(numWorkers * 2)
-	db.SetMaxIdleConns(numWorkers)
-	db.SetConnMaxLifetime(time.Hour)
-
-	// Build INSERT statement - skip auto-increment columns
-	columnNames := make([]string, 0, len(dg.tableDef.Columns))
-	placeholders := make([]string, 0, len(dg.tableDef.Columns))
-
-	for _, column := range dg.tableDef.Columns {
-		// Skip auto-increment columns
-		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-			continue
-		}
-		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
-		placeholders = append(placeholders, "?")
-	}
-
-	// Use smaller batch size for better progress reporting
-	batchSize := 100
-
-	// Track unique values for unique key columns across all workers
-	var uniqueMutex sync.Mutex
-	uniqueSets := make([]map[string]struct{}, 0)
-	keyCols := make([][]string, 0)
-	if len(dg.tableDef.PrimaryKey) > 0 {
-		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
-	}
-	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
-	for range keyCols {
-		uniqueSets = append(uniqueSets, make(map[string]struct{}))
-	}
-
-	// Pre-generate all rows with uniqueness check to avoid race conditions
-	allRows := make([][]interface{}, 0, numRows)
-	rowID := 1 // Start from 1 for each benchmark
-
-	// Debug: Print unique constraints
-	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
-	for i, colSet := range keyCols {
-		debugPrint("[DEBUG]  Constraint %d: %v\n", i, colSet)
-	}
-
-	for i := 0; i < numRows; i++ {
-		// Generate row with uniqueness check
-		var row TableRow
-		maxRetries := 100
-		for retry := 0; retry < maxRetries; retry++ {
-			row = dg.GenerateRow(rowID)
-
-			// Check uniqueness for unique key columns
-			uniqueMutex.Lock()
-			isUnique := true
-			for i, colSet := range keyCols {
-				key := ""
-				for _, col := range colSet {
-					key += fmt.Sprintf("|%v", row[col])
-				}
-				if _, exists := uniqueSets[i][key]; exists {
-					debugPrint("[DEBUG] Duplicate key found for constraint %d: %s (retry %d)\n", i, key, retry)
-					isUnique = false
-					break
-				}
-			}
-
-			if isUnique {
-				// Mark as used
-				for i, colSet := range keyCols {
-					key := ""
-					for _, col := range colSet {
-						key += fmt.Sprintf("|%v", row[col])
-					}
-					uniqueSets[i][key] = struct{}{}
-				}
-				uniqueMutex.Unlock()
-				break
-			}
-			uniqueMutex.Unlock()
-
-			if retry == maxRetries-1 {
-				debugPrint("[DEBUG] Failed to generate unique row after %d retries. Last row: %+v\n", maxRetries, row)
-				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
-			}
-		}
-
-		// Convert row to interface slice for query - skip auto-increment columns
-		values := make([]interface{}, 0, len(dg.tableDef.Columns))
-		for _, column := range dg.tableDef.Columns {
-			// Skip auto-increment columns
-			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-				continue
-			}
-			values = append(values, row[column.Name])
-		}
-		allRows = append(allRows, values)
-		rowID++
-	}
-
-	// Create channels for coordination
-	jobs := make(chan int, numRows)
-	results := make(chan error, numWorkers)
-	var wg sync.WaitGroup
-
-	// Start worker goroutines
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			// Each worker gets its own database connection
-			workerDB, err := sql.Open("mysql", dsn)
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
-				return
-			}
-			defer workerDB.Close()
-
-			// Set session time zone to UTC
-			_, err = workerDB.Exec("SET time_zone = 'UTC'")
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
-				return
-			}
-
-			// Create temporary table with same structure in this worker's connection
-			tempTableName := fmt.Sprintf("temp_benchmark_%d_%d", time.Now().UnixNano(), workerID)
-			createTempTableSQL := fmt.Sprintf("CREATE TEMPORARY TABLE `%s` LIKE `%s`", tempTableName, tableName)
-			_, err = workerDB.Exec(createTempTableSQL)
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to create temporary table: %w", workerID, err)
-				return
-			}
-
-			// Clean up temporary table at the end
-			defer func() {
-				dropSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS `%s`", tempTableName)
-				workerDB.Exec(dropSQL)
-			}()
-
-			insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
-				tempTableName,
-				strings.Join(columnNames, ", "),
-				strings.Join(placeholders, ", "))
-
-			// Prepare statement for this worker
-			stmt, err := workerDB.Prepare(insertSQL)
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to prepare statement: %w", workerID, err)
-				return
-			}
-			defer stmt.Close()
-
-			// Process jobs
-			for startRow := range jobs {
-				endRow := startRow + batchSize
-				if endRow > numRows {
-					endRow = numRows
-				}
-
-				// Start transaction for this batch
-				tx, err := workerDB.Begin()
-				if err != nil {
-					results <- fmt.Errorf("worker %d failed to begin transaction: %w", workerID, err)
-					return
-				}
-
-				// Prepare statement for this transaction
-				txStmt := tx.Stmt(stmt)
-
-				// Insert pre-generated rows for this batch
-				for rowIdx := startRow; rowIdx < endRow; rowIdx++ {
-					// Execute insert
-					_, err := txStmt.Exec(allRows[rowIdx]...)
-					if err != nil {
-						tx.Rollback()
-						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, rowIdx+1, err)
-						return
-					}
-				}
-
-				// Commit transaction
-				if err := tx.Commit(); err != nil {
-					results <- fmt.Errorf("worker %d failed to commit transaction: %w", workerID, err)
-					return
-				}
-			}
-		}(w)
-	}
-
-	// Send jobs to workers
-	go func() {
-		for i := 0; i < numRows; i += batchSize {
-			jobs <- i
-		}
-		close(jobs)
-	}()
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect errors
-	for err := range results {
-		if err != nil {
-			return fmt.Errorf("parallel insert failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// Simple method to insert a batch to temporary table using bulk insert (for benchmarking)
-func (dg *DataGenerator) insertBatchToTempTableBulk(config DBConfig, tableName string, numRows int, numWorkers int) error {
-	// Create DSN
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-
-	// Connect to database
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return fmt.Errorf("failed to set session time_zone: %w", err)
-	}
-
-	// Configure connection pool
-	db.SetMaxOpenConns(numWorkers * 2)
-	db.SetMaxIdleConns(numWorkers)
-	db.SetConnMaxLifetime(time.Hour)
-
-	// Build INSERT statement - skip auto-increment columns
-	columnNames := make([]string, 0, len(dg.tableDef.Columns))
-	placeholders := make([]string, 0, len(dg.tableDef.Columns))
-
-	for _, column := range dg.tableDef.Columns {
-		// Skip auto-increment columns
-		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-			continue
-		}
-		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
-		placeholders = append(placeholders, "?")
-	}
-
-	// Track unique values for unique key columns across all workers
-	var uniqueMutex sync.Mutex
-	uniqueSets := make([]map[string]struct{}, 0)
-	keyCols := make([][]string, 0)
-	if len(dg.tableDef.PrimaryKey) > 0 {
-		keyCols = append(keyCols, dg.tableDef.PrimaryKey)
-	}
-	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
-	for range keyCols {
-		uniqueSets = append(uniqueSets, make(map[string]struct{}))
-	}
-
-	// Pre-generate all rows with uniqueness check to avoid race conditions
-	allRows := make([][]interface{}, 0, numRows)
-	rowID := 1 // Start from 1 for each benchmark
-
-	// Debug: Print unique constraints
-	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
-	for i, colSet := range keyCols {
-		debugPrint("[DEBUG]  Constraint %d: %v\n", i, colSet)
-	}
-
-	for i := 0; i < numRows; i++ {
-		// Generate row with uniqueness check
-		var row TableRow
-		maxRetries := 100
-		for retry := 0; retry < maxRetries; retry++ {
-			row = dg.GenerateRow(rowID)
-
-			// Check uniqueness for unique key columns
-			uniqueMutex.Lock()
-			isUnique := true
-			for i, colSet := range keyCols {
-				key := ""
-				for _, col := range colSet {
-					key += fmt.Sprintf("|%v", row[col])
-				}
-				if _, exists := uniqueSets[i][key]; exists {
-					debugPrint("[DEBUG] Duplicate key found for constraint %d: %s (retry %d)\n", i, key, retry)
-					isUnique = false
-					break
-				}
-			}
-
-			if isUnique {
-				// Mark as used
-				for i, colSet := range keyCols {
-					key := ""
-					for _, col := range colSet {
-						key += fmt.Sprintf("|%v", row[col])
-					}
-					uniqueSets[i][key] = struct{}{}
-				}
-				uniqueMutex.Unlock()
-				break
-			}
-			uniqueMutex.Unlock()
-
-			if retry == maxRetries-1 {
-				debugPrint("[DEBUG] Failed to generate unique row after %d retries. Last row: %+v\n", maxRetries, row)
-				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
-			}
-		}
-
-		// Convert row to interface slice for query - skip auto-increment columns
-		values := make([]interface{}, 0, len(dg.tableDef.Columns))
-		for _, column := range dg.tableDef.Columns {
-			// Skip auto-increment columns
-			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-				continue
-			}
-			values = append(values, row[column.Name])
-		}
-		allRows = append(allRows, values)
-		rowID++
-	}
-
-	// Use smaller batch size for better progress reporting
-	batchSize := 100
-
-	// Create channels for coordination
-	jobs := make(chan int, numRows)
-	results := make(chan error, numWorkers)
-	var wg sync.WaitGroup
-
-	// Start worker goroutines
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			// Each worker gets its own database connection
-			workerDB, err := sql.Open("mysql", dsn)
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
-				return
-			}
-			defer workerDB.Close()
-
-			// Set session time zone to UTC
-			_, err = workerDB.Exec("SET time_zone = 'UTC'")
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to set session time_zone: %w", workerID, err)
-				return
-			}
-
-			// Create temporary table with same structure in this worker's connection
-			tempTableName := fmt.Sprintf("temp_benchmark_%d_%d", time.Now().UnixNano(), workerID)
-			createTempTableSQL := fmt.Sprintf("CREATE TEMPORARY TABLE `%s` LIKE `%s`", tempTableName, tableName)
-			_, err = workerDB.Exec(createTempTableSQL)
-			if err != nil {
-				results <- fmt.Errorf("worker %d failed to create temporary table: %w", workerID, err)
-				return
-			}
-
-			// Clean up temporary table at the end
-			defer func() {
-				dropSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS `%s`", tempTableName)
-				workerDB.Exec(dropSQL)
-			}()
-
-			// Process jobs
-			for startRow := range jobs {
-				endRow := startRow + batchSize
-				if endRow > numRows {
-					endRow = numRows
-				}
-
-				// Build bulk INSERT statement for this batch
-				valueGroups := make([]string, 0, endRow-startRow)
-				allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
-
-				for rowIdx := startRow; rowIdx < endRow; rowIdx++ {
-					valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-					allValues = append(allValues, allRows[rowIdx]...)
-				}
-
-				bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-					tempTableName,
-					strings.Join(columnNames, ", "),
-					strings.Join(valueGroups, ", "))
-
-				// Execute bulk insert
-				_, err := workerDB.Exec(bulkInsertSQL, allValues...)
-				if err != nil {
-					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
-					return
-				}
-			}
-		}(w)
-	}
-
-	// Send jobs to workers
-	go func() {
-		for i := 0; i < numRows; i += batchSize {
-			jobs <- i
-		}
-		close(jobs)
-	}()
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	// Collect errors
-	for err := range results {
-		if err != nil {
-			return fmt.Errorf("parallel bulk insert failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// Get the current row count from a table
-func getCurrentRowCount(config DBConfig, tableName string) (int, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return 0, fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Set session time zone to UTC
-	_, err = db.Exec("SET time_zone = 'UTC'")
-	if err != nil {
-		return 0, fmt.Errorf("failed to set session time_zone: %w", err)
-	}
-
-	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM `%s`", tableName)
-	err = db.QueryRow(query).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get row count: %w", err)
-	}
-
-	return count, nil
-}
-
-// Helper function to get effective number of rows
-func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int, config *DBConfig, tableName string, isInsertMode bool) int {
-	effectiveRows := commandLineRows
-	if commandLineRows <= 0 && generator.stats != nil && generator.stats.Count > 0 {
-		fmt.Fprintf(os.Stderr, "Using row count from stats file: %d\n", generator.stats.Count)
-		effectiveRows = generator.stats.Count
-	}
-
-	// Apply max rows limit if specified
-	if maxRows > 0 && effectiveRows > maxRows {
-		fmt.Fprintf(os.Stderr, "Limiting rows to maximum: %d (requested: %d)\n", maxRows, effectiveRows)
-		effectiveRows = maxRows
-	}
-
-	// If in insert mode and we have a target count, consider existing rows
-	if isInsertMode && effectiveRows > 0 && config != nil && tableName != "" {
-		currentCount, err := getCurrentRowCount(*config, tableName)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to get current row count: %v\n", err)
-			fmt.Fprintf(os.Stderr, "Proceeding with full target count: %d\n", effectiveRows)
-		} else {
-			if currentCount >= effectiveRows {
-				fmt.Fprintf(os.Stderr, "Table already has %d rows, which meets or exceeds target of %d rows. No insert needed.\n", currentCount, effectiveRows)
-				return 0
-			}
-			rowsToInsert := effectiveRows - currentCount
-			fmt.Fprintf(os.Stderr, "Table has %d existing rows, will insert %d additional rows to reach target of %d\n", currentCount, rowsToInsert, effectiveRows)
-			effectiveRows = rowsToInsert
-		}
-	}
-
-	return effectiveRows
-}
-
-// Helper to check if a type is a string type
-func isStringType(typ string) bool {
-	baseType := typ
-	if idx := strings.Index(baseType, "("); idx != -1 {
-		baseType = baseType[:idx]
-	}
-	baseType = strings.ToLower(baseType)
-	return baseType == "varchar" || baseType == "char" || baseType == "text"
 }
 
 func main() {
 	// Define command-line flags
 	var (
 		// Database connection flags
-		host     = flag.String("host", "localhost", "Database host")
+		host     = flag.String("host", "127.0.0.1", "Database host")
 		port     = flag.Int("port", 3306, "Database port")
 		user     = flag.String("user", "root", "Database user")
 		password = flag.String("password", "", "Database password")
 		database = flag.String("database", "", "Database name")
 
 		// Short versions
-		hostShort     = flag.String("H", "localhost", "Database host (short)")
+		hostShort     = flag.String("H", "127.0.0.1", "Database host (short)")
 		portShort     = flag.Int("P", 3306, "Database port (short)")
 		userShort     = flag.String("u", "root", "Database user (short)")
 		passwordShort = flag.String("p", "", "Database password (short)")
@@ -2316,7 +2162,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		fmt.Fprintf(os.Stderr, "  Database Connection:\n")
-		fmt.Fprintf(os.Stderr, "    --host, -H <host>        Database host (default: localhost)\n")
+		fmt.Fprintf(os.Stderr, "    --host, -H <host>        Database host (default: 127.0.0.1)\n")
 		fmt.Fprintf(os.Stderr, "    --port, -P <port>        Database port (default: 3306)\n")
 		fmt.Fprintf(os.Stderr, "    --user, -u <user>        Database user (default: root)\n")
 		fmt.Fprintf(os.Stderr, "    --password, -p <pass>    Database password\n")
@@ -2339,23 +2185,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -f t.create.sql -s t.stats.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Generate JSON from database\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data directly to database (serial, 1 worker)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using bulk INSERT (faster)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers (8 workers)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --workers 8\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using parallel workers with bulk INSERT (fastest)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 8\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 8\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using auto-tuning (finds optimal worker count)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H localhost -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 0\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk --workers 0\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -2368,7 +2214,7 @@ func main() {
 
 	// Resolve conflicting flags (long form takes precedence)
 	finalHost := *host
-	if *hostShort != "localhost" {
+	if *hostShort != "127.0.0.1" {
 		finalHost = *hostShort
 	}
 
@@ -2438,7 +2284,7 @@ func main() {
 
 	if finalSQLFile != "" {
 		// File mode
-		if finalTable != "" || finalHost != "localhost" || finalPort != 3306 || finalUser != "root" || finalPassword != "" || finalDatabase != "" {
+		if finalTable != "" || finalHost != "127.0.0.1" || finalPort != 3306 || finalUser != "root" || finalPassword != "" || finalDatabase != "" {
 			fmt.Fprintf(os.Stderr, "Error: Database parameters should not be specified when using SQL file mode\n")
 			flag.Usage()
 			os.Exit(1)
@@ -2455,7 +2301,7 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, nil, finalTable, finalInsert)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		// Generate data
@@ -2496,16 +2342,10 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, &config, finalTable, finalInsert)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		if finalInsert {
-			// Check if no rows need to be inserted
-			if effectiveNumRows <= 0 {
-				fmt.Fprintf(os.Stderr, "No rows need to be inserted. Exiting.\n")
-				return
-			}
-
 			// Insert data directly to database
 			if finalWorkers == 0 {
 				// Auto-tuning mode
@@ -2557,4 +2397,51 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+}
+
+// Simple benchmark bulk insert function that uses an existing database connection
+func (dg *DataGenerator) benchmarkBulkInsertWithDB(db *sql.DB, tableName string, numRows int, startID int) error {
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	// Build bulk INSERT statement
+	valueGroups := make([]string, 0, numRows)
+	allValues := make([]interface{}, 0, numRows*len(placeholders))
+
+	for i := 0; i < numRows; i++ {
+		row := dg.GenerateRow(startID + i)
+		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			allValues = append(allValues, row[column.Name])
+		}
+	}
+
+	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(valueGroups, ", "))
+
+	// Execute bulk insert
+	_, err := db.Exec(bulkInsertSQL, allValues...)
+	if err != nil {
+		return fmt.Errorf("failed to execute bulk insert: %w", err)
+	}
+
+	return nil
 }
