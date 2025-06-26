@@ -1681,28 +1681,18 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
 
-		// Get the next available ID for this benchmark to avoid conflicts
-		nextID, err := getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available ID: %w", err)
-		}
-
-		// Benchmark with this number of workers for the full duration
 		startTime := time.Now()
 		stopTime := startTime.Add(benchmarkDuration)
 		rowsInserted := 0
-		currentID := nextID
 
-		// Run benchmark for the full duration using the real table
 		for time.Now().Before(stopTime) {
-			// Insert a batch of 100 rows using the real table
-			err = dg.insertBatchToRealTable(config, tableName, 100, workers, currentID)
+			// Insert a batch of 100 rows using the normal insert logic
+			err := dg.InsertDataToDBParallel(config, tableName, 100, workers)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
 				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
 			}
 			rowsInserted += 100
-			currentID += 100 // Increment ID for next batch
 		}
 
 		elapsed := time.Since(startTime)
@@ -1735,28 +1725,18 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
 
-		// Get the next available ID for this benchmark to avoid conflicts
-		nextID, err := getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available ID: %w", err)
-		}
-
-		// Benchmark with this number of workers for the full duration
 		startTime := time.Now()
 		stopTime := startTime.Add(benchmarkDuration)
 		rowsInserted := 0
-		currentID := nextID
 
-		// Run benchmark for the full duration using the real table
 		for time.Now().Before(stopTime) {
-			// Insert a batch of 100 rows using the real table
-			err = dg.insertBatchToRealTableBulk(config, tableName, 100, workers, currentID)
+			// Insert a batch of 100 rows using the normal bulk insert logic
+			err := dg.InsertDataToDBBulkParallel(config, tableName, 100, workers)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "  Benchmark failed with %d workers: %v\n", workers, err)
 				return fmt.Errorf("benchmark failed with %d workers: %w", workers, err)
 			}
 			rowsInserted += 100
-			currentID += 100 // Increment ID for next batch
 		}
 
 		elapsed := time.Since(startTime)
@@ -1777,8 +1757,8 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 	return dg.InsertDataToDBBulkParallel(config, tableName, numRows, bestWorkers)
 }
 
-// Simple method to insert a batch to real table (uses specified start ID)
-func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName string, numRows int, numWorkers int, startID int) error {
+// Simple method to insert a batch to temporary table (for benchmarking)
+func (dg *DataGenerator) insertBatchToTempTable(config DBConfig, tableName string, numRows int, numWorkers int) error {
 	// Create DSN
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -1814,11 +1794,6 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 		placeholders = append(placeholders, "?")
 	}
 
-	insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
-		tableName,
-		strings.Join(columnNames, ", "),
-		strings.Join(placeholders, ", "))
-
 	// Use smaller batch size for better progress reporting
 	batchSize := 100
 
@@ -1836,7 +1811,7 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 
 	// Pre-generate all rows with uniqueness check to avoid race conditions
 	allRows := make([][]interface{}, 0, numRows)
-	rowID := startID
+	rowID := 1 // Start from 1 for each benchmark
 
 	// Debug: Print unique constraints
 	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
@@ -1925,6 +1900,26 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 				return
 			}
 
+			// Create temporary table with same structure in this worker's connection
+			tempTableName := fmt.Sprintf("temp_benchmark_%d_%d", time.Now().UnixNano(), workerID)
+			createTempTableSQL := fmt.Sprintf("CREATE TEMPORARY TABLE `%s` LIKE `%s`", tempTableName, tableName)
+			_, err = workerDB.Exec(createTempTableSQL)
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to create temporary table: %w", workerID, err)
+				return
+			}
+
+			// Clean up temporary table at the end
+			defer func() {
+				dropSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS `%s`", tempTableName)
+				workerDB.Exec(dropSQL)
+			}()
+
+			insertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES (%s)",
+				tempTableName,
+				strings.Join(columnNames, ", "),
+				strings.Join(placeholders, ", "))
+
 			// Prepare statement for this worker
 			stmt, err := workerDB.Prepare(insertSQL)
 			if err != nil {
@@ -1956,7 +1951,7 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 					_, err := txStmt.Exec(allRows[rowIdx]...)
 					if err != nil {
 						tx.Rollback()
-						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, startID+rowIdx, err)
+						results <- fmt.Errorf("worker %d failed to insert row %d: %w", workerID, rowIdx+1, err)
 						return
 					}
 				}
@@ -1994,8 +1989,8 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 	return nil
 }
 
-// Simple method to insert a batch to real table using bulk insert (uses specified start ID)
-func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName string, numRows int, numWorkers int, startID int) error {
+// Simple method to insert a batch to temporary table using bulk insert (for benchmarking)
+func (dg *DataGenerator) insertBatchToTempTableBulk(config DBConfig, tableName string, numRows int, numWorkers int) error {
 	// Create DSN
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -2045,7 +2040,7 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 
 	// Pre-generate all rows with uniqueness check to avoid race conditions
 	allRows := make([][]interface{}, 0, numRows)
-	rowID := startID
+	rowID := 1 // Start from 1 for each benchmark
 
 	// Debug: Print unique constraints
 	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
@@ -2137,6 +2132,21 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 				return
 			}
 
+			// Create temporary table with same structure in this worker's connection
+			tempTableName := fmt.Sprintf("temp_benchmark_%d_%d", time.Now().UnixNano(), workerID)
+			createTempTableSQL := fmt.Sprintf("CREATE TEMPORARY TABLE `%s` LIKE `%s`", tempTableName, tableName)
+			_, err = workerDB.Exec(createTempTableSQL)
+			if err != nil {
+				results <- fmt.Errorf("worker %d failed to create temporary table: %w", workerID, err)
+				return
+			}
+
+			// Clean up temporary table at the end
+			defer func() {
+				dropSQL := fmt.Sprintf("DROP TEMPORARY TABLE IF EXISTS `%s`", tempTableName)
+				workerDB.Exec(dropSQL)
+			}()
+
 			// Process jobs
 			for startRow := range jobs {
 				endRow := startRow + batchSize
@@ -2154,7 +2164,7 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 				}
 
 				bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-					tableName,
+					tempTableName,
 					strings.Join(columnNames, ", "),
 					strings.Join(valueGroups, ", "))
 
