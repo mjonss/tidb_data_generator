@@ -463,9 +463,11 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 		if len(colSet) == 1 {
 			colName := colSet[0]
 			colType := ""
+			colSize := 0
 			for _, c := range dg.tableDef.Columns {
 				if c.Name == colName {
 					colType = c.Type
+					colSize = c.Size
 					break
 				}
 			}
@@ -473,15 +475,26 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 				row[colName] = id
 			} else if isStringType(colType) {
 				// For string unique columns, generate deterministic unique value
-				uniqueValue := fmt.Sprintf("%s_%d", colName, id)
-				// Find the column to get its size
-				for _, c := range dg.tableDef.Columns {
-					if c.Name == colName {
-						// Truncate to column size if specified
-						if c.Size > 0 && len(uniqueValue) > c.Size {
-							uniqueValue = uniqueValue[:c.Size]
-						}
-						break
+				// Use a more compact format for small column sizes
+				var uniqueValue string
+				if colSize > 0 && colSize < 10 {
+					// For very small columns, use just numbers
+					uniqueValue = fmt.Sprintf("%d", id)
+					if len(uniqueValue) > colSize {
+						uniqueValue = uniqueValue[:colSize]
+					}
+				} else if colSize > 0 && colSize < 20 {
+					// For small columns, use short prefix + number
+					prefix := colName[:min(3, len(colName))]
+					uniqueValue = fmt.Sprintf("%s%d", prefix, id)
+					if len(uniqueValue) > colSize {
+						uniqueValue = uniqueValue[:colSize]
+					}
+				} else {
+					// For larger columns, use full format
+					uniqueValue = fmt.Sprintf("%s_%d", colName, id)
+					if colSize > 0 && len(uniqueValue) > colSize {
+						uniqueValue = uniqueValue[:colSize]
 					}
 				}
 				row[colName] = uniqueValue
@@ -499,6 +512,14 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	}
 
 	return row
+}
+
+// Helper function to get minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // Helper to check if a type is a string type
@@ -532,9 +553,11 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 			if len(colSet) == 1 {
 				colName := colSet[0]
 				colType := ""
+				colSize := 0
 				for _, c := range dg.tableDef.Columns {
 					if c.Name == colName {
 						colType = c.Type
+						colSize = c.Size
 						break
 					}
 				}
@@ -542,15 +565,26 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 					row[colName] = nextInt
 				} else if isStringType(colType) {
 					// For string unique columns, generate deterministic unique value
-					uniqueValue := fmt.Sprintf("%s_%d", colName, nextInt)
-					// Find the column to get its size
-					for _, c := range dg.tableDef.Columns {
-						if c.Name == colName {
-							// Truncate to column size if specified
-							if c.Size > 0 && len(uniqueValue) > c.Size {
-								uniqueValue = uniqueValue[:c.Size]
-							}
-							break
+					// Use a more compact format for small column sizes
+					var uniqueValue string
+					if colSize > 0 && colSize < 10 {
+						// For very small columns, use just numbers
+						uniqueValue = fmt.Sprintf("%d", nextInt)
+						if len(uniqueValue) > colSize {
+							uniqueValue = uniqueValue[:colSize]
+						}
+					} else if colSize > 0 && colSize < 20 {
+						// For small columns, use short prefix + number
+						prefix := colName[:min(3, len(colName))]
+						uniqueValue = fmt.Sprintf("%s%d", prefix, nextInt)
+						if len(uniqueValue) > colSize {
+							uniqueValue = uniqueValue[:colSize]
+						}
+					} else {
+						// For larger columns, use full format
+						uniqueValue = fmt.Sprintf("%s_%d", colName, nextInt)
+						if colSize > 0 && len(uniqueValue) > colSize {
+							uniqueValue = uniqueValue[:colSize]
 						}
 					}
 					row[colName] = uniqueValue
