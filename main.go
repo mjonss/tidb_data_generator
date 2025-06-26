@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"regexp"
@@ -448,6 +449,20 @@ func (dg *DataGenerator) generateTimeFromStats(columnName string) time.Time {
 	return time.Now().Add(time.Duration(dg.rand.Int63n(365*24*60*60)) * time.Second)
 }
 
+// Helper: base36 encoding for compact unique strings
+func base36(n int) string {
+	const chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+	if n == 0 {
+		return "0"
+	}
+	res := ""
+	for n > 0 {
+		res = string(chars[n%36]) + res
+		n /= 36
+	}
+	return res
+}
+
 func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	row := make(TableRow)
 
@@ -458,9 +473,11 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	}
 	keyCols = append(keyCols, dg.tableDef.UniqueKeys...)
 
-	// For integer single-column PK/UK, generate sequentially
+	usedCols := map[string]bool{}
+
 	for _, colSet := range keyCols {
 		if len(colSet) == 1 {
+			// Single-column key: use existing logic
 			colName := colSet[0]
 			colType := ""
 			colSize := 0
@@ -474,30 +491,59 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 			if strings.Contains(colType, "int") {
 				row[colName] = id
 			} else if isStringType(colType) {
-				// For string unique columns, generate deterministic unique value
-				// Use a more compact format for small column sizes
-				var uniqueValue string
-				if colSize > 0 && colSize < 10 {
-					// For very small columns, use just numbers
-					uniqueValue = fmt.Sprintf("%d", id)
-					if len(uniqueValue) > colSize {
-						uniqueValue = uniqueValue[:colSize]
-					}
-				} else if colSize > 0 && colSize < 20 {
-					// For small columns, use short prefix + number
-					prefix := colName[:min(3, len(colName))]
-					uniqueValue = fmt.Sprintf("%s%d", prefix, id)
-					if len(uniqueValue) > colSize {
-						uniqueValue = uniqueValue[:colSize]
-					}
-				} else {
-					// For larger columns, use full format
-					uniqueValue = fmt.Sprintf("%s_%d", colName, id)
-					if colSize > 0 && len(uniqueValue) > colSize {
-						uniqueValue = uniqueValue[:colSize]
+				val := base36(id)
+				if colSize > 0 && len(val) > colSize {
+					val = val[:colSize]
+				}
+				row[colName] = val
+			}
+			usedCols[colName] = true
+		} else if len(colSet) > 1 {
+			// Composite key: generate unique tuple
+			// Compute the number of possible values for each column
+			cardinalities := make([]int, len(colSet))
+			for i, colName := range colSet {
+				for _, c := range dg.tableDef.Columns {
+					if c.Name == colName {
+						if strings.Contains(c.Type, "int") {
+							cardinalities[i] = math.MaxInt32 // effectively unlimited
+						} else if isStringType(c.Type) {
+							// For string, cardinality is 36^size (base36)
+							if c.Size > 0 {
+								cardinalities[i] = int(math.Pow(36, float64(c.Size)))
+							} else {
+								cardinalities[i] = math.MaxInt32
+							}
+						} else {
+							cardinalities[i] = math.MaxInt32
+						}
+						break
 					}
 				}
-				row[colName] = uniqueValue
+			}
+			// Mixed-radix decomposition of id
+			n := id
+			for i, colName := range colSet {
+				var val interface{}
+				for _, c := range dg.tableDef.Columns {
+					if c.Name == colName {
+						if strings.Contains(c.Type, "int") {
+							val = n % cardinalities[i]
+						} else if isStringType(c.Type) {
+							strVal := base36(n % cardinalities[i])
+							if c.Size > 0 && len(strVal) > c.Size {
+								strVal = strVal[:c.Size]
+							}
+							val = strVal
+						} else {
+							val = n % cardinalities[i]
+						}
+						break
+					}
+				}
+				row[colName] = val
+				n /= cardinalities[i]
+				usedCols[colName] = true
 			}
 		}
 	}
@@ -512,24 +558,6 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 	}
 
 	return row
-}
-
-// Helper function to get minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// Helper to check if a type is a string type
-func isStringType(typ string) bool {
-	baseType := typ
-	if idx := strings.Index(baseType, "("); idx != -1 {
-		baseType = baseType[:idx]
-	}
-	baseType = strings.ToLower(baseType)
-	return baseType == "varchar" || baseType == "char" || baseType == "text"
 }
 
 func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
@@ -567,7 +595,13 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 					// For string unique columns, generate deterministic unique value
 					// Use a more compact format for small column sizes
 					var uniqueValue string
-					if colSize > 0 && colSize < 10 {
+					if colSize > 0 && colSize < 5 {
+						// For very small columns, use just a single character + number
+						uniqueValue = fmt.Sprintf("%c%d", 'A'+(nextInt%26), nextInt)
+						if len(uniqueValue) > colSize {
+							uniqueValue = uniqueValue[:colSize]
+						}
+					} else if colSize > 0 && colSize < 10 {
 						// For very small columns, use just numbers
 						uniqueValue = fmt.Sprintf("%d", nextInt)
 						if len(uniqueValue) > colSize {
@@ -1804,6 +1838,12 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 	allRows := make([][]interface{}, 0, numRows)
 	rowID := startID
 
+	// Debug: Print unique constraints
+	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
+	for i, colSet := range keyCols {
+		debugPrint("[DEBUG]  Constraint %d: %v\n", i, colSet)
+	}
+
 	for i := 0; i < numRows; i++ {
 		// Generate row with uniqueness check
 		var row TableRow
@@ -1820,6 +1860,7 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 					key += fmt.Sprintf("|%v", row[col])
 				}
 				if _, exists := uniqueSets[i][key]; exists {
+					debugPrint("[DEBUG] Duplicate key found for constraint %d: %s (retry %d)\n", i, key, retry)
 					isUnique = false
 					break
 				}
@@ -1840,6 +1881,7 @@ func (dg *DataGenerator) insertBatchToRealTable(config DBConfig, tableName strin
 			uniqueMutex.Unlock()
 
 			if retry == maxRetries-1 {
+				debugPrint("[DEBUG] Failed to generate unique row after %d retries. Last row: %+v\n", maxRetries, row)
 				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
 			}
 		}
@@ -2005,6 +2047,12 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 	allRows := make([][]interface{}, 0, numRows)
 	rowID := startID
 
+	// Debug: Print unique constraints
+	debugPrint("[DEBUG] Unique constraints for table %s:\n", tableName)
+	for i, colSet := range keyCols {
+		debugPrint("[DEBUG]  Constraint %d: %v\n", i, colSet)
+	}
+
 	for i := 0; i < numRows; i++ {
 		// Generate row with uniqueness check
 		var row TableRow
@@ -2021,6 +2069,7 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 					key += fmt.Sprintf("|%v", row[col])
 				}
 				if _, exists := uniqueSets[i][key]; exists {
+					debugPrint("[DEBUG] Duplicate key found for constraint %d: %s (retry %d)\n", i, key, retry)
 					isUnique = false
 					break
 				}
@@ -2041,6 +2090,7 @@ func (dg *DataGenerator) insertBatchToRealTableBulk(config DBConfig, tableName s
 			uniqueMutex.Unlock()
 
 			if retry == maxRetries-1 {
+				debugPrint("[DEBUG] Failed to generate unique row after %d retries. Last row: %+v\n", maxRetries, row)
 				return fmt.Errorf("failed to generate unique row after %d retries", maxRetries)
 			}
 		}
@@ -2201,6 +2251,16 @@ func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows 
 	}
 
 	return effectiveRows
+}
+
+// Helper to check if a type is a string type
+func isStringType(typ string) bool {
+	baseType := typ
+	if idx := strings.Index(baseType, "("); idx != -1 {
+		baseType = baseType[:idx]
+	}
+	baseType = strings.ToLower(baseType)
+	return baseType == "varchar" || baseType == "char" || baseType == "text"
 }
 
 func main() {
