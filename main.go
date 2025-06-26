@@ -1971,8 +1971,15 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 	maxWorkers := 8 // Reduced from 16 to avoid port exhaustion
 	bestWorkers := 1
 	bestPerformance := 0.0
+	totalRowsInserted := 0 // Track total rows inserted across all benchmark phases
 
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
+		// Check if we've already inserted enough rows
+		if totalRowsInserted >= numRows {
+			fmt.Fprintf(os.Stderr, "Target of %d rows already reached during benchmarking, stopping auto-tuning\n", numRows)
+			break
+		}
+
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -2014,6 +2021,14 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 					if time.Now().After(stopTime) {
 						return
 					}
+					// Check if we've reached the target
+					mu.Lock()
+					if totalRowsInserted+rowsInserted >= numRows {
+						mu.Unlock()
+						return
+					}
+					mu.Unlock()
+
 					// Use a simple benchmark insert that doesn't conflict
 					if err := dg.benchmarkInsertWithDB(db, tableName, batchSize, startID); err != nil {
 						// Just log the error and continue for benchmarking
@@ -2027,8 +2042,12 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 			}(w)
 		}
 		wg.Wait()
+
+		// Update total rows inserted
+		totalRowsInserted += rowsInserted
+
 		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
-		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
+		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec (total inserted: %d/%d)\n", workers, performance, totalRowsInserted, numRows)
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
@@ -2036,9 +2055,19 @@ func (dg *DataGenerator) InsertDataToDBParallelAutoTune(config DBConfig, tableNa
 			break
 		}
 	}
+
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
-	fmt.Fprintf(os.Stderr, "Inserting %d rows with %d workers...\n", numRows, bestWorkers)
-	return dg.InsertDataToDBParallel(config, tableName, numRows, bestWorkers)
+
+	// Check if we've already inserted all the required rows
+	if totalRowsInserted >= numRows {
+		fmt.Fprintf(os.Stderr, "All %d rows already inserted during benchmarking\n", numRows)
+		return nil
+	}
+
+	// Calculate remaining rows to insert
+	remainingRows := numRows - totalRowsInserted
+	fmt.Fprintf(os.Stderr, "Inserting remaining %d rows with %d workers...\n", remainingRows, bestWorkers)
+	return dg.InsertDataToDBParallel(config, tableName, remainingRows, bestWorkers)
 }
 
 // Auto-tuning parallel bulk insert method
@@ -2049,8 +2078,15 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 	maxWorkers := 8 // Reduced from 16 to avoid port exhaustion
 	bestWorkers := 1
 	bestPerformance := 0.0
+	totalRowsInserted := 0 // Track total rows inserted across all benchmark phases
 
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
+		// Check if we've already inserted enough rows
+		if totalRowsInserted >= numRows {
+			fmt.Fprintf(os.Stderr, "Target of %d rows already reached during benchmarking, stopping auto-tuning\n", numRows)
+			break
+		}
+
 		fmt.Fprintf(os.Stderr, "Testing with %d workers for %v...\n", workers, benchmarkDuration)
 		var wg sync.WaitGroup
 		var mu sync.Mutex
@@ -2092,6 +2128,14 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 					if time.Now().After(stopTime) {
 						return
 					}
+					// Check if we've reached the target
+					mu.Lock()
+					if totalRowsInserted+rowsInserted >= numRows {
+						mu.Unlock()
+						return
+					}
+					mu.Unlock()
+
 					// Use a simple benchmark bulk insert that doesn't conflict
 					if err := dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID); err != nil {
 						// Just log the error and continue for benchmarking
@@ -2105,8 +2149,12 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 			}(w)
 		}
 		wg.Wait()
+
+		// Update total rows inserted
+		totalRowsInserted += rowsInserted
+
 		performance := float64(rowsInserted) / benchmarkDuration.Seconds()
-		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
+		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec (total inserted: %d/%d)\n", workers, performance, totalRowsInserted, numRows)
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
@@ -2114,9 +2162,19 @@ func (dg *DataGenerator) InsertDataToDBBulkParallelAutoTune(config DBConfig, tab
 			break
 		}
 	}
+
 	fmt.Fprintf(os.Stderr, "Best performance: %d workers (%.0f rows/sec)\n", bestWorkers, bestPerformance)
-	fmt.Fprintf(os.Stderr, "Inserting %d rows with %d workers...\n", numRows, bestWorkers)
-	return dg.InsertDataToDBBulkParallel(config, tableName, numRows, bestWorkers)
+
+	// Check if we've already inserted all the required rows
+	if totalRowsInserted >= numRows {
+		fmt.Fprintf(os.Stderr, "All %d rows already inserted during benchmarking\n", numRows)
+		return nil
+	}
+
+	// Calculate remaining rows to insert
+	remainingRows := numRows - totalRowsInserted
+	fmt.Fprintf(os.Stderr, "Inserting remaining %d rows with %d workers...\n", remainingRows, bestWorkers)
+	return dg.InsertDataToDBBulkParallel(config, tableName, remainingRows, bestWorkers)
 }
 
 func main() {
