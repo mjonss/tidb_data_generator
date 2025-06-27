@@ -1063,7 +1063,7 @@ func getNextAvailableID(config DBConfig, tableDef *TableDef) (int, error) {
 	err = db.QueryRow(query).Scan(&maxID)
 	if err != nil {
 		debugPrint("[DEBUG] getNextAvailableID: query failed: %v\n", err)
-		return 1, nil
+		return 1, err
 	}
 	debugPrint("[DEBUG] getNextAvailableID: maxID.Valid=%v, maxID.Int64=%d\n", maxID.Valid, maxID.Int64)
 	if maxID.Valid {
@@ -1082,22 +1082,46 @@ func isStringType(typ string) bool {
 	return baseType == "varchar" || baseType == "char" || baseType == "text"
 }
 
+// Get table count
+func getTableCount(config DBConfig, table string) (uint, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return 0, fmt.Errorf("failed to connect to database: %w", err)
+	}
+	defer db.Close()
+
+	// Try to get the maximum PK value from the table
+	query := fmt.Sprintf("SELECT count(*) FROM %s", table)
+	var count uint
+	err = db.QueryRow(query).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // Helper function to get effective number of rows
-func getEffectiveNumRows(generator *DataGenerator, commandLineRows uint, maxRows uint) uint {
-	// If command line specified rows, use that
-	if commandLineRows > 0 {
-		if maxRows > 0 && commandLineRows > maxRows {
-			return maxRows
-		}
-		return commandLineRows
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows uint, maxRows uint, tableCount uint) uint {
+	if generator.stats != nil && generator.stats.Count > 0 {
+		commandLineRows = uint(generator.stats.Count)
 	}
 
-	// Otherwise, use count from stats file
-	if generator.stats != nil && generator.stats.Count > 0 {
-		if maxRows > 0 && generator.stats.Count > maxRows {
-			return maxRows
+	if commandLineRows > 0 {
+		if maxRows > 0 {
+			if tableCount > 0 {
+				if tableCount >= maxRows {
+					return 0
+				}
+				return maxRows - tableCount
+			}
+			if commandLineRows > maxRows {
+				return maxRows
+			}
 		}
-		return uint(generator.stats.Count)
+		return commandLineRows
 	}
 
 	// Fallback
@@ -1424,7 +1448,7 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string,
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "  Batch size %d: %.0f rows/sec\n", batchSize, performance)
+		log.Printf("Batch size %d: %.0f rows/sec\n", batchSize, performance)
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestBatchSize = batchSize
@@ -1436,7 +1460,7 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string,
 
 // Find optimal worker count with a given batch size
 func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName string, batchSize uint) uint {
-	fmt.Fprintf(os.Stderr, "Testing worker counts with batch size %d...\n", batchSize)
+	log.Printf("Testing worker counts with batch size %d...\n", batchSize)
 
 	maxWorkers := uint(8)
 	bestWorkers := uint(1)
@@ -1477,7 +1501,7 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 			continue
 		}
 
-		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
+		log.Printf("  %d workers: %.0f rows/sec\n", workers, performance)
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
@@ -1640,7 +1664,7 @@ finished:
 	totalRate := float64(completedRows) / totalTime.Seconds()
 
 	if !options.BenchmarkMode {
-		fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
+		log.Printf("Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 			completedRows, tableName, totalTime.Seconds(), totalRate)
 	}
 
@@ -1673,7 +1697,7 @@ func main() {
 		sqlFileShort = flag.String("f", "", "SQL file path (short)")
 		numRows      = flag.Uint("rows", 0, "Number of rows to generate")
 		numRowsShort = flag.Uint("n", 0, "Number of rows to generate (short)")
-		maxRows      = flag.Uint("max-rows", 0, "Maximum number of rows to generate (0=no limit)")
+		maxRows      = flag.Uint("max-table-rows", 0, "Do not exceed table row count (0=no limit)")
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
 		bulkInsert   = flag.Uint("bulk", 0, "Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)")
@@ -1699,7 +1723,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --table, -t <table>      Table name (required for database mode)\n")
 		fmt.Fprintf(os.Stderr, "    --sql, -f <file>         SQL file path (required for file mode)\n")
 		fmt.Fprintf(os.Stderr, "    --rows, -n <num>         Number of rows to generate (required, or use count from stats file)\n")
-		fmt.Fprintf(os.Stderr, "    --max-rows <num>         Maximum number of rows to generate (0=no limit)\n")
+		fmt.Fprintf(os.Stderr, "    --max-table-rows <num>   Do not exceed table row count (0=no limit)\n")
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
 		fmt.Fprintf(os.Stderr, "    --bulk <size>            Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)\n")
@@ -1829,7 +1853,7 @@ func main() {
 		}
 
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, 0)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		// Generate data
@@ -1871,8 +1895,14 @@ func main() {
 			log.Fatalf("Failed to create data generator: %v", err)
 		}
 
+		tableCount, err := getTableCount(config, finalTable)
+		if err != nil {
+			log.Fatalf("Failed to get table count: %v", err)
+		}
+		debugPrint("[DEBUG] tableCount: %d\n", tableCount)
+
 		// Get effective number of rows (from stats if available)
-		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows)
+		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, tableCount)
 		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
 
 		if finalInsert {
