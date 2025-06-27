@@ -1195,11 +1195,9 @@ func progressMonitor(rowsToInsert, maxRows uint) chan uint {
 		for {
 			select {
 			case <-progressTicker.C:
-				elapsed := time.Since(startTime)
-				rateTotal := float64(completedRows) / elapsed.Seconds()
 				now := time.Now()
 				rateNow := float64(completedRows-lastReportedCount) / now.Sub(lastTime).Seconds()
-				fmt.Printf("\rCompleted %d rows... (%.0f rows/sec, tot %.0f rows/sec %d remaining)", completedRows, rateNow, rateTotal, maxRows-completedRows)
+				fmt.Printf("\rCompleted %d rows... (%.0f rows/sec, %d remaining)", completedRows, rateNow, maxRows-completedRows)
 				lastTime = now
 				lastReportedCount = completedRows
 			case addCount, ok := <-updateCompletedRows:
@@ -1418,24 +1416,18 @@ func (dg *DataGenerator) InsertData(
 ) (float64, uint, error) {
 	startTime := time.Now()
 
-	log.Printf("[DEBUG] InsertData: starting with %d rows, batchSize=%d, workers=%d, options=%#v\n",
-		numRows, batchSize, numWorkers, options)
-	debugPrint("[DEBUG] InsertData: starting with %d rows, batchSize=%d, workers=%d, options=%#v\n",
-		numRows, batchSize, numWorkers, options)
-
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
 
 	// Create channels for coordination
 	jobs := make(chan Jobs, 10)
 	results := make(chan error, numWorkers)
-	var progressChan chan uint
+	var reportChan chan uint
 	var wg sync.WaitGroup
 
-	if options.BenchmarkMode {
-		progressChan = make(chan uint, numWorkers)
-	} else {
-		progressChan = progressMonitor(numRows, options.MaxRows)
+	progressChan := make(chan uint, numWorkers)
+	if !options.BenchmarkMode {
+		reportChan = progressMonitor(numRows, options.MaxRows)
 	}
 
 	// Start worker goroutines
@@ -1498,12 +1490,16 @@ func (dg *DataGenerator) InsertData(
 		wg.Wait()
 		close(results)
 		close(progressChan)
+		if reportChan != nil {
+			close(reportChan)
+		}
 	}()
 
 	// Monitor progress and collect errors
 	completedRows := uint(0)
 
 	// Collect progress updates and errors
+Loop:
 	for {
 		select {
 		case rowsInserted, ok := <-progressChan:
@@ -1514,12 +1510,15 @@ func (dg *DataGenerator) InsertData(
 						return 0.0, completedRows, fmt.Errorf("parallel insert failed: %w", err)
 					}
 				}
-				goto finished
+				break Loop
 			}
 			// Since workers send incremental counts, we just add them
 			completedRows += rowsInserted
 			if completedRows > numRows {
 				completedRows = numRows
+			}
+			if reportChan != nil {
+				reportChan <- rowsInserted
 			}
 		case err := <-results:
 			if err != nil {
@@ -1528,14 +1527,8 @@ func (dg *DataGenerator) InsertData(
 		}
 	}
 
-finished:
 	totalTime := time.Since(startTime)
 	totalRate := float64(completedRows) / totalTime.Seconds()
-
-	if !options.BenchmarkMode {
-		log.Printf("Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
-			completedRows, tableName, totalTime.Seconds(), totalRate)
-	}
 
 	return totalRate, completedRows, nil
 }
@@ -1745,6 +1738,7 @@ func main() {
 			flag.Usage()
 			os.Exit(1)
 		}
+		startTime := time.Now()
 
 		config := DBConfig{
 			Host:     finalHost,
@@ -1835,6 +1829,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to insert data: %v", err)
 		}
+		log.Printf("Successfully inserted %d rows (%.0f rows/sec) into table %s\n", rowsToInsert, float64(rowsToInsert)/time.Since(startTime).Seconds(), finalTable)
 		return
 	}
 
