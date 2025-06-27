@@ -2206,7 +2206,7 @@ func main() {
 		maxRows      = flag.Int("max-rows", 0, "Maximum number of rows to generate (0=no limit)")
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
-		bulkInsert   = flag.Bool("bulk", true, "Use bulk INSERT for faster database insertion (default: true)")
+		bulkInsert   = flag.Int("bulk", 0, "Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)")
 		workers      = flag.Int("workers", 0, "Number of parallel workers (default: 0=auto-tune, 1=serial, >1=parallel)")
 
 		// Help
@@ -2232,7 +2232,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "    --max-rows <num>         Maximum number of rows to generate (0=no limit)\n")
 		fmt.Fprintf(os.Stderr, "    --stats, -s <file>       Stats file path (optional)\n")
 		fmt.Fprintf(os.Stderr, "    --insert, -i             Insert data directly to database\n")
-		fmt.Fprintf(os.Stderr, "    --bulk                   Use bulk INSERT for faster insertion (default: true)\n")
+		fmt.Fprintf(os.Stderr, "    --bulk <size>            Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)\n")
 		fmt.Fprintf(os.Stderr, "    --workers <num>          Number of parallel workers (default: 0=auto-tune, 1=serial, >1=parallel)\n")
 		fmt.Fprintf(os.Stderr, "    --verbose                Enable verbose debug output\n")
 		fmt.Fprintf(os.Stderr, "    --help, -h               Show this help message\n\n")
@@ -2256,7 +2256,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --workers 8\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  \n")
 		fmt.Fprintf(os.Stderr, "  # Insert data using individual INSERT statements (no bulk)\n")
-		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk=false\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk=1\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  \n")
+		fmt.Fprintf(os.Stderr, "  # Insert data using specific bulk batch size (5000 rows per batch)\n")
+		fmt.Fprintf(os.Stderr, "  %s -H 127.0.0.1 -P 4000 -u root -D test -t mytable -n 1000 -s t.stats.json -i --bulk=5000\n", os.Args[0])
 	}
 
 	flag.Parse()
@@ -2403,13 +2406,13 @@ func main() {
 		if finalInsert {
 			// Insert data directly to database
 			if finalWorkers == 0 {
-				// Auto-tuning mode - use unified method for both bulk and non-bulk
+				// Auto-tuning mode - use unified method
 				if err := generator.InsertDataToDBUnified(config, finalTable, effectiveNumRows, finalBulkInsert); err != nil {
 					log.Fatalf("Failed to insert data: %v", err)
 				}
 			} else if finalWorkers == 1 {
 				// Serial processing (1 worker)
-				if finalBulkInsert {
+				if finalBulkInsert > 0 {
 					if err := generator.InsertDataToDBBulk(config, finalTable, effectiveNumRows); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
@@ -2420,7 +2423,7 @@ func main() {
 				}
 			} else {
 				// Parallel processing (multiple workers)
-				if finalBulkInsert {
+				if finalBulkInsert > 0 {
 					if err := generator.InsertDataToDBBulkParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
 						log.Fatalf("Failed to insert data: %v", err)
 					}
@@ -2496,12 +2499,18 @@ func (dg *DataGenerator) benchmarkBulkInsertWithDB(db *sql.DB, tableName string,
 }
 
 // Unified insert method with auto-tuning for both batch size and worker count
-func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string, numRows int, useBulk bool) error {
+func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string, numRows int, batchSize int) error {
 	fmt.Fprintf(os.Stderr, "Auto-tuning unified insert for %d rows...\n", numRows)
 
-	// First, find optimal batch size
-	optimalBatchSize := dg.findOptimalBatchSize(config, tableName, useBulk)
-	fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
+	// If batchSize is 0, find optimal batch size, otherwise use the provided batch size
+	var optimalBatchSize int
+	if batchSize == 0 {
+		optimalBatchSize = dg.findOptimalBatchSize(config, tableName)
+		fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
+	} else {
+		optimalBatchSize = batchSize
+		fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
+	}
 
 	// Then, find optimal worker count with the optimal batch size
 	optimalWorkers := dg.findOptimalWorkerCount(config, tableName, optimalBatchSize)
@@ -2512,21 +2521,16 @@ func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string
 }
 
 // Find optimal batch size by testing different batch sizes
-func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string, useBulk bool) int {
+func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string) int {
 	fmt.Fprintf(os.Stderr, "Testing batch sizes...\n")
 
-	var batchSizes []int
-	if useBulk {
-		batchSizes = []int{1, 10, 50, 100, 500, 1000, 5000}
-	} else {
-		batchSizes = []int{1, 5, 10, 20, 50, 100}
-	}
+	batchSizes := []int{1, 5, 10, 20, 50, 100, 500, 1000, 5000}
 
 	bestBatchSize := 1
 	bestPerformance := 0.0
 
 	for _, batchSize := range batchSizes {
-		performance := dg.benchmarkBatchSize(config, tableName, batchSize, useBulk)
+		performance := dg.benchmarkBatchSize(config, tableName, batchSize)
 		fmt.Fprintf(os.Stderr, "  Batch size %d: %.0f rows/sec\n", batchSize, performance)
 		if performance > bestPerformance {
 			bestPerformance = performance
@@ -2538,7 +2542,7 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string,
 }
 
 // Benchmark a specific batch size
-func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, batchSize int, useBulk bool) float64 {
+func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, batchSize int) float64 {
 	benchmarkDuration := 1 * time.Second
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
@@ -2564,11 +2568,7 @@ func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, b
 
 	for time.Now().Before(stopTime) {
 		var err error
-		if useBulk {
-			err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
-		} else {
-			err = dg.benchmarkInsertWithDB(db, tableName, batchSize, startID)
-		}
+		err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
 		if err != nil {
 			break
 		}
