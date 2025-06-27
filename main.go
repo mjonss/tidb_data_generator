@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -1182,16 +1181,15 @@ func (dg *DataGenerator) buildInsertStatement(
 	return bulkInsertSQL, allValues
 }
 
-func progressMonitor() chan uint {
+func progressMonitor(rowsToInsert, maxRows uint) chan uint {
 	updateCompletedRows := make(chan uint, 10)
-	log.Printf("Starting progress monitor")
 
 	// Start progress monitoring goroutine
 	go func() {
 		progressTicker := time.NewTicker(1 * time.Second)
 		defer progressTicker.Stop()
 		lastReportedCount := uint(0)
-		completedRows := uint(0)
+		completedRows := maxRows - rowsToInsert
 		startTime := time.Now()
 		lastTime := startTime
 		for {
@@ -1201,13 +1199,12 @@ func progressMonitor() chan uint {
 				rateTotal := float64(completedRows) / elapsed.Seconds()
 				now := time.Now()
 				rateNow := float64(completedRows-lastReportedCount) / now.Sub(lastTime).Seconds()
-				fmt.Printf("\rCompleted %d rows... (%.0f rows/sec, tot %.0f rows/sec)", completedRows, rateNow, rateTotal)
+				fmt.Printf("\rCompleted %d rows... (%.0f rows/sec, tot %.0f rows/sec %d remaining)", completedRows, rateNow, rateTotal, maxRows-completedRows)
 				lastTime = now
 				lastReportedCount = completedRows
 			case addCount, ok := <-updateCompletedRows:
 				if !ok {
 					fmt.Printf("\n")
-					log.Printf("Progress monitor closed")
 					return
 				}
 				completedRows += addCount
@@ -1270,141 +1267,8 @@ func (dg *DataGenerator) GenerateRowWithCompositeKey(id int, nextCompositeKeys m
 	return row
 }
 
-// Unified benchmark function that can benchmark any combination of batch size and worker count
-func (dg *DataGenerator) BenchmarkCore(
-	config DBConfig,
-	tableName string,
-	batchSize uint,
-	numWorkers uint,
-	duration time.Duration,
-) (float64, uint) {
-	dgDebug := func(format string, args ...interface{}) {
-		if verboseMode {
-			fmt.Fprintf(os.Stderr, format, args...)
-		}
-	}
-
-	dgDebug("[DEBUG] BenchmarkCore: starting benchmark with batchSize=%d, workers=%d, duration=%v\n", batchSize, numWorkers, duration)
-
-	// Get the next available values for primary keys
-	var nextID int
-	var nextCompositeKeys map[string]int
-	var err error
-
-	if len(dg.tableDef.PrimaryKey) == 1 {
-		dgDebug("[DEBUG] BenchmarkCore: getting next available ID for single PK\n")
-		nextID, err = getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			dgDebug("[DEBUG] BenchmarkCore: failed to get next available ID: %v\n", err)
-			return 0.0, 0
-		}
-	} else if len(dg.tableDef.PrimaryKey) > 1 {
-		dgDebug("[DEBUG] BenchmarkCore: getting next available composite key\n")
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			dgDebug("[DEBUG] BenchmarkCore: failed to get next available composite key: %v\n", err)
-			return 0.0, 0
-		}
-		nextID = 1000000 // Use high ID to avoid conflicts
-	} else {
-		nextID = 1000000 // Use high ID to avoid conflicts
-	}
-
-	// Use a high start ID to avoid conflicts with existing data
-	startID := nextID + 1000000
-	dgDebug("[DEBUG] BenchmarkCore: using startID=%d\n", startID)
-
-	// Create a channel to track progress
-	progressChan := make(chan uint, 1000)
-	var totalRowsInserted uint
-	var lastReportedCount uint
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-
-	// Start a goroutine to collect progress
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		dgDebug("[DEBUG] BenchmarkCore: progress collector started\n")
-		for rows := range progressChan {
-			mu.Lock()
-			// Since InsertCore provides cumulative counts, we need to track the difference
-			if rows > lastReportedCount {
-				totalRowsInserted += rows - lastReportedCount
-				lastReportedCount = rows
-			}
-			mu.Unlock()
-		}
-		dgDebug("[DEBUG] BenchmarkCore: progress collector finished\n")
-	}()
-
-	// Create a context with timeout for the benchmark
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
-	defer cancel()
-
-	// Start the insert in a goroutine
-	errChan := make(chan error, 1)
-	insertStartTime := time.Now()
-	go func() {
-		dgDebug("[DEBUG] BenchmarkCore: insert goroutine started\n")
-		// Use InsertCore with a progress callback
-		// Use a reasonable number of rows for benchmarking (10x batch size, but at least 100)
-
-		benchmarkRows := batchSize * 10
-		if benchmarkRows < 100 {
-			benchmarkRows = 100
-		}
-		if benchmarkRows > 10000 {
-			benchmarkRows = 10000 // Cap at 10k rows for benchmarking
-		}
-		dgDebug("[DEBUG] BenchmarkCore: calling InsertData with %d rows\n", benchmarkRows)
-		_, _, err := dg.InsertData(config, tableName, benchmarkRows, batchSize, numWorkers, startID, nextCompositeKeys, InsertOptions{
-			BenchmarkMode: true,
-			MaxDuration:   1 * time.Second,
-			Verbose:       verboseMode,
-			ProgressCallback: func(inserted uint) {
-				select {
-				case progressChan <- inserted:
-				default:
-				}
-			},
-		})
-		dgDebug("[DEBUG] BenchmarkCore: InsertCore returned with err=%v\n", err)
-		errChan <- err
-		close(progressChan)
-	}()
-
-	dgDebug("[DEBUG] BenchmarkCore: waiting for completion or timeout\n")
-	// Wait for either timeout or completion
-	select {
-	case <-ctx.Done():
-		dgDebug("[DEBUG] BenchmarkCore: timeout reached\n")
-		// Benchmark timeout reached
-	case err := <-errChan:
-		dgDebug("[DEBUG] BenchmarkCore: received error from insert goroutine: %v\n", err)
-		if err != nil {
-			mu.Lock()
-			rowsInserted := totalRowsInserted
-			mu.Unlock()
-			wg.Wait()
-			return 0.0, rowsInserted
-		}
-	}
-
-	dgDebug("[DEBUG] BenchmarkCore: waiting for all goroutines to finish\n")
-	wg.Wait()
-
-	dgDebug("[DEBUG] BenchmarkCore: finished with %d rows inserted\n", totalRowsInserted)
-	// Calculate performance using actual insert time
-	actualInsertTime := time.Since(insertStartTime)
-	if actualInsertTime.Seconds() > 0 {
-		return float64(totalRowsInserted) / actualInsertTime.Seconds(), totalRowsInserted
-	}
-	return 0.0, totalRowsInserted
-}
-
 // Find optimal batch size by testing different batch sizes
-func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string, maxRows uint) uint {
+func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string, rows uint) (uint, uint) {
 	log.Printf("Testing batch sizes...\n")
 
 	batchSizes := []uint{1, 50, 1000, 10000}
@@ -1414,60 +1278,15 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string,
 	bestPerformance := 0.0
 
 	for _, batchSize := range batchSizes {
+		log.Printf("batch size: %d\n", batchSize)
 
-		// Get the next available values for primary keys
-		var nextID int
-		var nextCompositeKeys map[string]int
-		var err error
-
-		if len(dg.tableDef.PrimaryKey) == 1 {
-			nextID, err = getNextAvailableID(config, dg.tableDef)
-			if err != nil {
-				continue
-			}
-		} else if len(dg.tableDef.PrimaryKey) > 1 {
-			nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-			if err != nil {
-				continue
-			}
-			nextID = 1000000 // Use high ID to avoid conflicts
-		} else {
-			nextID = 1000000 // Use high ID to avoid conflicts
+		if batchSize > rows {
+			batchSize = rows
+			log.Printf("Decreased last batch size: %d\n", batchSize)
 		}
-
-		// Use a high start ID to avoid conflicts with existing data
-		startID := nextID + 1000000
-
-		options := InsertOptions{
-			BenchmarkMode: true,
-			MaxDuration:   1 * time.Second,
-			Verbose:       verboseMode,
-		}
-
-		performance, _, err := dg.InsertData(config, tableName, 1000, batchSize, 1, startID, nextCompositeKeys, options)
-		if err != nil {
+		if batchSize == 0 {
 			continue
 		}
-
-		log.Printf("Batch size %d: %.0f rows/sec\n", batchSize, performance)
-		if performance > bestPerformance {
-			bestPerformance = performance
-			bestBatchSize = batchSize
-		}
-	}
-
-	return bestBatchSize
-}
-
-// Find optimal worker count with a given batch size
-func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName string, batchSize uint) uint {
-	log.Printf("Testing worker counts with batch size %d...\n", batchSize)
-
-	maxWorkers := uint(8)
-	bestWorkers := uint(1)
-	bestPerformance := 0.0
-
-	for workers := uint(1); workers <= maxWorkers; workers *= 2 {
 		// Get the next available values for primary keys
 		var nextID int
 		var nextCompositeKeys map[string]int
@@ -1497,12 +1316,71 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 			Verbose:       verboseMode,
 		}
 
-		performance, _, err := dg.InsertData(config, tableName, 1000, batchSize, workers, startID, nextCompositeKeys, options)
+		performance, rowsDone, err := dg.InsertData(config, tableName, rows, batchSize, 1, startID, nextCompositeKeys, options)
 		if err != nil {
+			log.Printf("Failed to insert data: %v", err)
 			continue
 		}
 
-		log.Printf("  %d workers: %.0f rows/sec\n", workers, performance)
+		rows -= rowsDone
+		log.Printf("Batch size %d: %.0f rows/sec (this run: %d, remaining: %d)\n", batchSize, performance, rowsDone, rows)
+		if performance > bestPerformance {
+			bestPerformance = performance
+			bestBatchSize = batchSize
+		}
+	}
+
+	return bestBatchSize, rows
+}
+
+// Find optimal worker count with a given batch size
+func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName string, batchSize uint, rows uint) (uint, uint) {
+	log.Printf("Testing worker counts with batch size %d and %d rows...\n", batchSize, rows)
+
+	maxWorkers := uint(8)
+	bestWorkers := uint(1)
+	bestPerformance := 0.0
+
+	for workers := uint(1); workers <= maxWorkers; workers *= 2 {
+		if rows == 0 {
+			break
+		}
+		// Get the next available values for primary keys
+		var nextID int
+		var nextCompositeKeys map[string]int
+		var err error
+
+		if len(dg.tableDef.PrimaryKey) == 1 {
+			nextID, err = getNextAvailableID(config, dg.tableDef)
+			if err != nil {
+				continue
+			}
+		} else if len(dg.tableDef.PrimaryKey) > 1 {
+			nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+			if err != nil {
+				continue
+			}
+			nextID = 1000000 // Use high ID to avoid conflicts
+		} else {
+			nextID = 1000000 // Use high ID to avoid conflicts
+		}
+
+		// Use a high start ID to avoid conflicts with existing data
+		startID := nextID + 1000000
+
+		options := InsertOptions{
+			BenchmarkMode: true,
+			MaxDuration:   2 * time.Second,
+			Verbose:       verboseMode,
+		}
+
+		performance, rowsDone, err := dg.InsertData(config, tableName, rows, batchSize, workers, startID, nextCompositeKeys, options)
+		if err != nil {
+			log.Fatalf("Failed to insert data: %v", err)
+		}
+		rows -= rowsDone
+
+		log.Printf("  %d workers: %.0f rows/sec (this run: %d, remaining: %d)\n", workers, performance, rowsDone, rows)
 		if performance > bestPerformance {
 			bestPerformance = performance
 			bestWorkers = workers
@@ -1511,16 +1389,20 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 		}
 	}
 
-	return bestWorkers
+	return bestWorkers, rows
 }
 
 // InsertOptions controls the behavior of InsertData
 type InsertOptions struct {
-	BenchmarkMode    bool                // If true, run in benchmark mode with time limits
-	MaxDuration      time.Duration       // Maximum time to run (for benchmark mode)
-	MaxRows          uint                // Maximum number of rows to insert
-	ProgressCallback func(inserted uint) // Optional progress callback
-	Verbose          bool                // Enable verbose output
+	BenchmarkMode bool          // If true, run in benchmark mode with time limits
+	MaxDuration   time.Duration // Maximum time to run (for benchmark mode)
+	MaxRows       uint          // Maximum number of rows to insert
+	Verbose       bool          // Enable verbose output
+}
+
+type Jobs struct {
+	StartRow uint
+	EndRow   uint
 }
 
 // InsertData is a unified function that handles both real insertion and benchmarking
@@ -1536,29 +1418,16 @@ func (dg *DataGenerator) InsertData(
 ) (float64, uint, error) {
 	startTime := time.Now()
 
-	// For benchmark mode, limit the number of rows to insert
-	rowsToInsert := numRows
-	if options.BenchmarkMode {
-		benchmarkRows := batchSize * 10
-		if benchmarkRows < 100 {
-			benchmarkRows = 100
-		}
-		if benchmarkRows > 10000 {
-			benchmarkRows = 10000 // Cap at 10k rows for benchmarking
-		}
-		rowsToInsert = benchmarkRows
-	}
-
-	if options.Verbose {
-		fmt.Fprintf(os.Stderr, "[DEBUG] InsertData: starting with %d rows, batchSize=%d, workers=%d, benchmarkMode=%v\n",
-			rowsToInsert, batchSize, numWorkers, options.BenchmarkMode)
-	}
+	log.Printf("[DEBUG] InsertData: starting with %d rows, batchSize=%d, workers=%d, options=%#v\n",
+		numRows, batchSize, numWorkers, options)
+	debugPrint("[DEBUG] InsertData: starting with %d rows, batchSize=%d, workers=%d, options=%#v\n",
+		numRows, batchSize, numWorkers, options)
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
 
 	// Create channels for coordination
-	jobs := make(chan uint, numRows)
+	jobs := make(chan Jobs, 10)
 	results := make(chan error, numWorkers)
 	var progressChan chan uint
 	var wg sync.WaitGroup
@@ -1566,11 +1435,11 @@ func (dg *DataGenerator) InsertData(
 	if options.BenchmarkMode {
 		progressChan = make(chan uint, numWorkers)
 	} else {
-		progressChan = progressMonitor()
+		progressChan = progressMonitor(numRows, options.MaxRows)
 	}
 
 	// Start worker goroutines
-	if numWorkers <= 1 {
+	if numWorkers < 1 {
 		numWorkers = 1
 	}
 	for w := uint(0); w < numWorkers; w++ {
@@ -1592,24 +1461,22 @@ func (dg *DataGenerator) InsertData(
 			workerDB.SetConnMaxLifetime(time.Hour)
 
 			// Process jobs
-			for startRow := range jobs {
-				endRow := uint(startRow) + batchSize
-				if endRow > numRows {
-					endRow = numRows
-				}
-
+			for job := range jobs {
 				// Build bulk INSERT statement for this batch
-				bulkInsertSQL, allValues := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
+				bulkInsertSQL, allValues := dg.buildInsertStatement(tableName, job.StartRow, job.EndRow, nextID, nextCompositeKeys)
 
 				// Execute bulk insert
 				_, err = workerDB.Exec(bulkInsertSQL, allValues...)
 				if err != nil {
-					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w len all values: %d startRow: %d endRow: %d\n%s", workerID, err, len(allValues), startRow, endRow, bulkInsertSQL)
+					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w len all values: %d startRow: %d endRow: %d len sql %d", workerID, err, len(allValues), job.StartRow, job.EndRow, len(bulkInsertSQL))
 					return
 				}
 
 				// Send progress update
-				progressChan <- batchSize
+				progressChan <- job.EndRow - job.StartRow
+				if options.MaxDuration > 0 && time.Since(startTime) > options.MaxDuration {
+					break
+				}
 			}
 		}(w)
 	}
@@ -1617,7 +1484,11 @@ func (dg *DataGenerator) InsertData(
 	// Send jobs to workers
 	go func() {
 		for i := uint(0); i < numRows; i += batchSize {
-			jobs <- i
+			endRow := i + batchSize
+			if endRow > numRows {
+				endRow = numRows
+			}
+			jobs <- Jobs{StartRow: i, EndRow: endRow}
 		}
 		close(jobs)
 	}()
@@ -1649,9 +1520,6 @@ func (dg *DataGenerator) InsertData(
 			completedRows += rowsInserted
 			if completedRows > numRows {
 				completedRows = numRows
-			}
-			if options.ProgressCallback != nil {
-				options.ProgressCallback(completedRows)
 			}
 		case err := <-results:
 			if err != nil {
@@ -1904,110 +1772,69 @@ func main() {
 
 		// Get effective number of rows (from stats if available)
 		effectiveNumRows := getEffectiveNumRows(generator, finalNumRows, finalMaxRows, tableCount)
-		debugPrint("[DEBUG] effectiveNumRows: %d\n", effectiveNumRows)
-
-		if finalInsert {
-			// Insert data directly to database
-			if finalWorkers == 0 {
-				// Auto-tuning mode - find optimal batch size and worker count
-				log.Printf("Auto-tuning insert for %d rows...\n", effectiveNumRows)
-
-				// Find optimal batch size if not specified
-				var optimalBatchSize uint
-				if finalBulkInsert == 0 {
-					optimalBatchSize = generator.findOptimalBatchSize(config, finalTable, effectiveNumRows)
-					log.Printf("Optimal batch size: %d rows\n", optimalBatchSize)
-				} else {
-					optimalBatchSize = finalBulkInsert
-					log.Printf("Using specified batch size: %d rows\n", optimalBatchSize)
-				}
-
-				// Find optimal worker count
-				optimalWorkers := generator.findOptimalWorkerCount(config, finalTable, optimalBatchSize)
-				log.Printf("Optimal worker count: %d\n", optimalWorkers)
-
-				// Get the next available values for primary keys
-				var nextID int
-				var nextCompositeKeys map[string]int
-				var err error
-
-				if len(tableDef.PrimaryKey) == 1 {
-					nextID, err = getNextAvailableID(config, tableDef)
-					if err != nil {
-						log.Fatalf("Failed to get next available ID: %v", err)
-					}
-					log.Printf("Starting with ID: %d\n", nextID)
-				} else if len(tableDef.PrimaryKey) > 1 {
-					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
-					if err != nil {
-						log.Fatalf("Failed to get next available composite key: %v", err)
-					}
-					log.Printf("Starting with composite keys: %v\n", nextCompositeKeys)
-					nextID = 1
-				} else {
-					nextID = 1
-					log.Printf("No primary key found, starting from ID: %d\n", nextID)
-				}
-
-				_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, InsertOptions{
-					BenchmarkMode: false,
-					Verbose:       finalVerbose,
-				})
-				if err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
-				}
-			} else {
-				// Get the next available values for primary keys
-				var nextID int
-				var nextCompositeKeys map[string]int
-				var err error
-
-				if len(tableDef.PrimaryKey) == 1 {
-					// Single-column primary key
-					nextID, err = getNextAvailableID(config, tableDef)
-					if err != nil {
-						log.Fatalf("Failed to get next available ID: %v", err)
-					}
-					log.Printf("Starting with ID: %d\n", nextID)
-				} else if len(tableDef.PrimaryKey) > 1 {
-					// Composite primary key
-					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
-					if err != nil {
-						log.Fatalf("Failed to get next available composite key: %v", err)
-					}
-					log.Printf("Starting with composite keys: %v\n", nextCompositeKeys)
-					nextID = 1 // Use 1 as base for generating unique combinations
-				} else {
-					// No primary key, start from 1
-					nextID = 1
-					log.Printf("No primary key found, starting from ID: %d\n", nextID)
-				}
-
-				// Determine batch size
-				batchSize := uint(1)
-				if finalBulkInsert > 0 {
-					batchSize = finalBulkInsert
-				} else if finalWorkers > 1 {
-					batchSize = 1000 // Default batch size for parallel processing
-				}
-
-				_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, InsertOptions{
-					BenchmarkMode: false,
-					Verbose:       finalVerbose,
-				})
-				if err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
-				}
-			}
+		log.Printf("rows to insert: %d\n", effectiveNumRows)
+		if effectiveNumRows == 0 {
+			log.Printf("No rows to insert, table %s has %d rows\n", finalTable, tableCount)
 			return
 		}
-		// Generate data and output as JSON
-		rows := generator.GenerateData(effectiveNumRows)
-		output, err := json.MarshalIndent(rows, "", "  ")
-		if err != nil {
-			log.Fatalf("Failed to marshal data: %v", err)
+
+		if !finalInsert {
+			// Generate data and output as JSON
+			rows := generator.GenerateData(effectiveNumRows)
+			output, err := json.MarshalIndent(rows, "", "  ")
+			if err != nil {
+				log.Fatalf("Failed to marshal data: %v", err)
+			}
+			fmt.Println(string(output))
+			return
 		}
-		fmt.Println(string(output))
+
+		// Insert data directly to database
+		// Find optimal batch size if not specified
+		batchSize := finalBulkInsert
+		rowsToInsert := effectiveNumRows
+		if batchSize == 0 {
+			batchSize, effectiveNumRows = generator.findOptimalBatchSize(config, finalTable, effectiveNumRows)
+			log.Printf("Optimal batch size: %d rows (rows done: %d, remaining: %d)\n", batchSize, rowsToInsert-effectiveNumRows, effectiveNumRows)
+		}
+		workers := finalWorkers
+		if workers == 0 {
+			workers, effectiveNumRows = generator.findOptimalWorkerCount(config, finalTable, batchSize, effectiveNumRows)
+			log.Printf("Optimal worker count: %d (rows done: %d, remaining: %d)\n", workers, rowsToInsert-effectiveNumRows, effectiveNumRows)
+		}
+
+		// Get the next available values for primary keys
+		var nextID int
+		var nextCompositeKeys map[string]int
+
+		if len(tableDef.PrimaryKey) == 1 {
+			nextID, err = getNextAvailableID(config, tableDef)
+			if err != nil {
+				log.Fatalf("Failed to get next available ID: %v", err)
+			}
+			log.Printf("Starting with ID: %d\n", nextID)
+		} else if len(tableDef.PrimaryKey) > 1 {
+			nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
+			if err != nil {
+				log.Fatalf("Failed to get next available composite key: %v", err)
+			}
+			log.Printf("Starting with composite keys: %v\n", nextCompositeKeys)
+			nextID = 1
+		} else {
+			nextID = 1
+			log.Printf("No primary key found, starting from ID: %d\n", nextID)
+		}
+
+		_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, batchSize, workers,
+			nextID, nextCompositeKeys,
+			InsertOptions{
+				BenchmarkMode: false,
+				Verbose:       finalVerbose,
+				MaxRows:       rowsToInsert,
+			})
+		if err != nil {
+			log.Fatalf("Failed to insert data: %v", err)
+		}
 		return
 	}
 
