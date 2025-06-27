@@ -50,7 +50,7 @@ type TableDef struct {
 
 // Statistics structures
 type Stats struct {
-	Count   int                    `json:"count"`
+	Count   uint                   `json:"count"`
 	Columns map[string]ColumnStats `json:"columns"`
 }
 
@@ -602,7 +602,7 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 }
 
 // Helper: extract representative values for a column from stats
-func (dg *DataGenerator) getColumnValueSet(colName string, max int) []interface{} {
+func (dg *DataGenerator) getColumnValueSet(colName string, max uint) []interface{} {
 	if dg.stats == nil {
 		return nil
 	}
@@ -621,7 +621,7 @@ func (dg *DataGenerator) getColumnValueSet(colName string, max int) []interface{
 				val = strings.TrimSpace(val)
 				val = strings.ToValidUTF8(val, "")
 				values = append(values, val)
-				if len(values) >= max {
+				if len(values) >= int(max) {
 					return values
 				}
 			}
@@ -638,15 +638,15 @@ func (dg *DataGenerator) getColumnValueSet(colName string, max int) []interface{
 				val = strings.TrimSpace(val)
 				val = strings.ToValidUTF8(val, "")
 				values = append(values, val)
-				if len(values) >= max {
+				if len(values) >= int(max) {
 					return values
 				}
 			}
 		}
 	}
 	// Use NDV to generate synthetic values if needed
-	if colStats.Histogram != nil && colStats.Histogram.NDV > 0 && len(values) < max {
-		for i := len(values); i < max && i < colStats.Histogram.NDV; i++ {
+	if colStats.Histogram != nil && colStats.Histogram.NDV > 0 && len(values) < int(max) {
+		for i := len(values); i < int(max) && i < colStats.Histogram.NDV; i++ {
 			values = append(values, fmt.Sprintf("%s_%d", colName, i))
 		}
 	}
@@ -654,13 +654,13 @@ func (dg *DataGenerator) getColumnValueSet(colName string, max int) []interface{
 }
 
 // Generate unique combinations for composite keys using stats
-func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numRows int) [][]interface{} {
+func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numRows uint) [][]interface{} {
 	valueSets := make([][]interface{}, len(keyCols))
 	for i, col := range keyCols {
 		valueSets[i] = dg.getColumnValueSet(col, numRows)
 		if len(valueSets[i]) == 0 {
 			// Fallback: generate synthetic values
-			for j := 0; j < numRows; j++ {
+			for j := uint(0); j < numRows; j++ {
 				valueSets[i] = append(valueSets[i], fmt.Sprintf("%s_%d", col, j))
 			}
 		}
@@ -669,7 +669,7 @@ func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numR
 	combos := [][]interface{}{}
 	var generate func(idx int, current []interface{})
 	generate = func(idx int, current []interface{}) {
-		if len(combos) >= numRows {
+		if len(combos) >= int(numRows) {
 			return
 		}
 		if idx == len(valueSets) {
@@ -687,7 +687,7 @@ func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numR
 }
 
 // Update GenerateData to use composite key combos from stats
-func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
+func (dg *DataGenerator) GenerateData(numRows uint) []TableRow {
 	rows := make([]TableRow, 0, numRows)
 	uniqueSets := make([]map[string]struct{}, 0)
 	keyCols := make([][]string, 0)
@@ -709,8 +709,8 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 	}
 
 	nextInt := 1
-	comboIdx := map[string]int{}
-	for len(rows) < numRows {
+	comboIdx := map[string]uint{}
+	for len(rows) < int(numRows) {
 		row := make(TableRow)
 		for _, colSet := range keyCols {
 			if len(colSet) == 1 {
@@ -756,7 +756,7 @@ func (dg *DataGenerator) GenerateData(numRows int) []TableRow {
 				key := strings.Join(colSet, ",")
 				combos := compositeCombos[key]
 				idx := comboIdx[key]
-				if idx >= len(combos) {
+				if idx >= uint(len(combos)) {
 					continue // exhausted combos
 				}
 				for i, colName := range colSet {
@@ -1083,7 +1083,7 @@ func isStringType(typ string) bool {
 }
 
 // Helper function to get effective number of rows
-func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows int) int {
+func getEffectiveNumRows(generator *DataGenerator, commandLineRows uint, maxRows uint) uint {
 	// If command line specified rows, use that
 	if commandLineRows > 0 {
 		if maxRows > 0 && commandLineRows > maxRows {
@@ -1097,7 +1097,7 @@ func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows 
 		if maxRows > 0 && generator.stats.Count > maxRows {
 			return maxRows
 		}
-		return generator.stats.Count
+		return uint(generator.stats.Count)
 	}
 
 	// Fallback
@@ -1107,7 +1107,7 @@ func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows 
 // buildInsertStatement builds a single INSERT statement for a batch of rows
 func (dg *DataGenerator) buildInsertStatement(
 	tableName string,
-	startRow, endRow int,
+	startRow, endRow uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
 ) (string, []interface{}, error) {
@@ -1124,9 +1124,9 @@ func (dg *DataGenerator) buildInsertStatement(
 
 	// Build bulk INSERT statement for this batch
 	valueGroups := make([]string, 0, endRow-startRow)
-	allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
+	allValues := make([]interface{}, 0, int(endRow-startRow)*len(placeholders))
 
-	for rowID := startRow; rowID < endRow; rowID++ {
+	for rowID := int(startRow); rowID < int(endRow); rowID++ {
 		var row TableRow
 		if len(dg.tableDef.PrimaryKey) == 1 {
 			row = dg.GenerateRow(nextID + rowID)
@@ -1155,191 +1155,151 @@ func (dg *DataGenerator) buildInsertStatement(
 	return bulkInsertSQL, allValues, nil
 }
 
+func progressMonitor() chan uint {
+	updateCompletedRows := make(chan uint, 10)
+
+	// Start progress monitoring goroutine
+	go func() {
+		progressTicker := time.NewTicker(1 * time.Second)
+		defer progressTicker.Stop()
+		lastReportedCount := uint(0)
+		completedRows := uint(0)
+		startTime := time.Now()
+		lastTime := startTime
+		for {
+			select {
+			case <-progressTicker.C:
+				elapsed := time.Since(startTime)
+				rateTotal := float64(completedRows) / elapsed.Seconds()
+				now := time.Now()
+				rateNow := float64(completedRows-lastReportedCount) / now.Sub(lastTime).Seconds()
+				fmt.Fprintf(os.Stderr, "Completed A %d rows... (%.0f rows/sec, tot %.0f rows/sec)\n", completedRows, rateNow, rateTotal)
+				lastTime = now
+				lastReportedCount = completedRows
+			case addCount, ok := <-updateCompletedRows:
+				if !ok {
+					return
+				}
+				completedRows += addCount
+			}
+		}
+	}()
+	return updateCompletedRows
+}
+
 // Core insert function: handles batch size, parallelism, and PK type
 func (dg *DataGenerator) InsertCore(
 	config DBConfig,
 	tableName string,
-	numRows int,
-	batchSize int,
-	numWorkers int,
+	numRows uint,
+	batchSize uint,
+	numWorkers uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
-	progressCb func(inserted int),
+	progressCb func(inserted uint),
 ) error {
 	startTime := time.Now()
 
-	if numWorkers <= 1 {
-		// Serial insert
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-			config.User, config.Password, config.Host, config.Port, config.Database)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			return fmt.Errorf("failed to connect to database: %w", err)
-		}
-		defer db.Close()
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
 
-		// Configure connection pool
-		db.SetMaxOpenConns(10)
-		db.SetMaxIdleConns(5)
-		db.SetConnMaxLifetime(time.Hour)
+	// Create channels for coordination
+	jobs := make(chan uint, numRows)
+	results := make(chan error, numWorkers)
+	progress := make(chan uint, numWorkers)
+	var wg sync.WaitGroup
 
-		// Test connection
-		if err := db.Ping(); err != nil {
-			return fmt.Errorf("failed to ping database: %w", err)
-		}
+	// Start worker goroutines
+	for w := uint(0); w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID uint) {
+			defer wg.Done()
 
-		completedRows := 0
-		for i := 0; i < numRows; i += batchSize {
-			end := i + batchSize
-			if end > numRows {
-				end = numRows
-			}
-
-			// Build bulk INSERT statement for this batch
-			bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, i, end, nextID, nextCompositeKeys)
+			// Each worker gets its own database connection
+			workerDB, err := sql.Open("mysql", dsn)
 			if err != nil {
-				return fmt.Errorf("failed to build insert statement: %w", err)
+				results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
+				return
 			}
+			defer workerDB.Close()
 
-			// Execute bulk insert
-			_, err = db.Exec(bulkInsertSQL, allValues...)
-			if err != nil {
-				return fmt.Errorf("failed to execute bulk insert: %w", err)
+			// Configure connection pool for parallel operations
+			workerDB.SetMaxOpenConns(2)
+			workerDB.SetMaxIdleConns(1)
+			workerDB.SetConnMaxLifetime(time.Hour)
+
+			// Process jobs
+			for startRow := range jobs {
+				endRow := startRow + batchSize
+				if endRow > numRows {
+					endRow = numRows
+				}
+
+				// Build bulk INSERT statement for this batch
+				bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
+				if err != nil {
+					results <- fmt.Errorf("worker %d failed to build insert statement: %w", workerID, err)
+					return
+				}
+
+				// Execute bulk insert
+				_, err = workerDB.Exec(bulkInsertSQL, allValues...)
+				if err != nil {
+					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
+					return
+				}
+
+				// Send progress update
+				progress <- endRow - startRow
 			}
+		}(w)
+	}
 
-			completedRows += end - i
+	// Send jobs to workers
+	go func() {
+		for i := uint(0); i < numRows; i += batchSize {
+			jobs <- i
+		}
+		close(jobs)
+	}()
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+		close(progress)
+	}()
+
+	// Monitor progress and collect errors
+	completedRows := uint(0)
+
+	done := make(chan bool)
+	// Collect progress updates and errors
+	for {
+		select {
+		case rowsInserted, ok := <-progress:
+			if !ok {
+				// Progress channel closed, check for errors
+				for err := range results {
+					if err != nil {
+						done <- true
+						return fmt.Errorf("parallel insert failed: %w", err)
+					}
+				}
+				done <- true
+				goto finished
+			}
+			completedRows += rowsInserted
+			if completedRows > numRows {
+				completedRows = numRows
+			}
 			if progressCb != nil {
 				progressCb(completedRows)
 			}
-		}
-
-		totalTime := time.Since(startTime)
-		totalRate := float64(numRows) / totalTime.Seconds()
-		fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
-			numRows, tableName, totalTime.Seconds(), totalRate)
-
-	} else {
-		// Parallel insert
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-			config.User, config.Password, config.Host, config.Port, config.Database)
-
-		// Create channels for coordination
-		jobs := make(chan int, numRows)
-		results := make(chan error, numWorkers)
-		progress := make(chan int, numWorkers)
-		var wg sync.WaitGroup
-
-		// Start worker goroutines
-		for w := 0; w < numWorkers; w++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-
-				// Each worker gets its own database connection
-				workerDB, err := sql.Open("mysql", dsn)
-				if err != nil {
-					results <- fmt.Errorf("worker %d failed to connect: %w", workerID, err)
-					return
-				}
-				defer workerDB.Close()
-
-				// Configure connection pool for parallel operations
-				workerDB.SetMaxOpenConns(2)
-				workerDB.SetMaxIdleConns(1)
-				workerDB.SetConnMaxLifetime(time.Hour)
-
-				// Process jobs
-				for startRow := range jobs {
-					endRow := startRow + batchSize
-					if endRow > numRows {
-						endRow = numRows
-					}
-
-					// Build bulk INSERT statement for this batch
-					bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
-					if err != nil {
-						results <- fmt.Errorf("worker %d failed to build insert statement: %w", workerID, err)
-						return
-					}
-
-					// Execute bulk insert
-					_, err = workerDB.Exec(bulkInsertSQL, allValues...)
-					if err != nil {
-						results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
-						return
-					}
-
-					// Send progress update
-					progress <- endRow - startRow
-				}
-			}(w)
-		}
-
-		// Send jobs to workers
-		go func() {
-			for i := 0; i < numRows; i += batchSize {
-				jobs <- i
-			}
-			close(jobs)
-		}()
-
-		// Wait for all workers to complete
-		go func() {
-			wg.Wait()
-			close(results)
-			close(progress)
-		}()
-
-		// Monitor progress and collect errors
-		completedRows := 0
-		progressTicker := time.NewTicker(1 * time.Second)
-		defer progressTicker.Stop()
-
-		done := make(chan bool)
-
-		// Start progress monitoring goroutine
-		go func() {
-			for {
-				select {
-				case <-progressTicker.C:
-					if completedRows > 0 {
-						elapsed := time.Since(startTime)
-						rate := float64(completedRows) / elapsed.Seconds()
-						fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
-					}
-				case <-done:
-					return
-				}
-			}
-		}()
-
-		// Collect progress updates and errors
-		for {
-			select {
-			case rowsInserted, ok := <-progress:
-				if !ok {
-					// Progress channel closed, check for errors
-					for err := range results {
-						if err != nil {
-							done <- true
-							return fmt.Errorf("parallel insert failed: %w", err)
-						}
-					}
-					done <- true
-					goto finished
-				}
-				completedRows += rowsInserted
-				if completedRows > numRows {
-					completedRows = numRows
-				}
-				if progressCb != nil {
-					progressCb(completedRows)
-				}
-			case err := <-results:
-				if err != nil {
-					done <- true
-					return fmt.Errorf("parallel insert failed: %w", err)
-				}
+		case err := <-results:
+			if err != nil {
+				done <- true
+				return fmt.Errorf("parallel insert failed: %w", err)
 			}
 		}
 
@@ -1410,10 +1370,10 @@ func (dg *DataGenerator) GenerateRowWithCompositeKey(id int, nextCompositeKeys m
 func (dg *DataGenerator) BenchmarkCore(
 	config DBConfig,
 	tableName string,
-	batchSize int,
-	numWorkers int,
+	batchSize uint,
+	numWorkers uint,
 	duration time.Duration,
-) (float64, int) {
+) (float64, uint) {
 	dgDebug := func(format string, args ...interface{}) {
 		if verboseMode {
 			fmt.Fprintf(os.Stderr, format, args...)
@@ -1451,9 +1411,9 @@ func (dg *DataGenerator) BenchmarkCore(
 	dgDebug("[DEBUG] BenchmarkCore: using startID=%d\n", startID)
 
 	// Create a channel to track progress
-	progressChan := make(chan int, 1000)
-	var totalRowsInserted int
-	var lastReportedCount int
+	progressChan := make(chan uint, 1000)
+	var totalRowsInserted uint
+	var lastReportedCount uint
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -1472,29 +1432,6 @@ func (dg *DataGenerator) BenchmarkCore(
 			mu.Unlock()
 		}
 		dgDebug("[DEBUG] BenchmarkCore: progress collector finished\n")
-	}()
-
-	// Add a real-time progress ticker
-	progressTicker := time.NewTicker(1 * time.Second)
-	defer progressTicker.Stop()
-	stopTicker := make(chan struct{})
-	go func() {
-		startTime := time.Now()
-		for {
-			select {
-			case <-progressTicker.C:
-				mu.Lock()
-				inserted := totalRowsInserted
-				mu.Unlock()
-				if inserted > 0 {
-					elapsed := time.Since(startTime)
-					rate := float64(inserted) / elapsed.Seconds()
-					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", inserted, rate)
-				}
-			case <-stopTicker:
-				return
-			}
-		}
 	}()
 
 	// Create a context with timeout for the benchmark
@@ -1517,7 +1454,7 @@ func (dg *DataGenerator) BenchmarkCore(
 			benchmarkRows = 10000 // Cap at 10k rows for benchmarking
 		}
 		dgDebug("[DEBUG] BenchmarkCore: calling InsertCore with %d rows\n", benchmarkRows)
-		err := dg.InsertCore(config, tableName, benchmarkRows, batchSize, numWorkers, startID, nextCompositeKeys, func(inserted int) {
+		err := dg.InsertCore(config, tableName, benchmarkRows, batchSize, numWorkers, startID, nextCompositeKeys, func(inserted uint) {
 			select {
 			case progressChan <- inserted:
 			default:
@@ -1540,43 +1477,33 @@ func (dg *DataGenerator) BenchmarkCore(
 			mu.Lock()
 			rowsInserted := totalRowsInserted
 			mu.Unlock()
-			close(stopTicker)
 			wg.Wait()
 			return 0.0, rowsInserted
 		}
 	}
 
-	close(stopTicker)
 	dgDebug("[DEBUG] BenchmarkCore: waiting for all goroutines to finish\n")
 	wg.Wait()
 
-	mu.Lock()
-	rowsInserted := totalRowsInserted
-	mu.Unlock()
-
-	dgDebug("[DEBUG] BenchmarkCore: finished with %d rows inserted\n", rowsInserted)
+	dgDebug("[DEBUG] BenchmarkCore: finished with %d rows inserted\n", totalRowsInserted)
 	// Calculate performance using actual insert time
 	actualInsertTime := time.Since(insertStartTime)
 	if actualInsertTime.Seconds() > 0 {
-		return float64(rowsInserted) / actualInsertTime.Seconds(), rowsInserted
+		return float64(totalRowsInserted) / actualInsertTime.Seconds(), totalRowsInserted
 	}
-	return 0.0, rowsInserted
+	return 0.0, totalRowsInserted
 }
 
 // Find optimal batch size by testing different batch sizes
-func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string) int {
+func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string, maxRows uint) uint {
 	fmt.Fprintf(os.Stderr, "Testing batch sizes...\n")
 
-	batchSizes := []int{1, 5, 10, 20, 50, 100, 500, 1000, 5000, 10000}
-	maxBatchSize := 10000
+	batchSizes := []uint{1, 5, 10, 20, 50, 100, 500, 1000, 5000, 10000}
 
-	bestBatchSize := 1
+	bestBatchSize := uint(1)
 	bestPerformance := 0.0
 
 	for _, batchSize := range batchSizes {
-		if batchSize > maxBatchSize {
-			continue
-		}
 
 		// Get the next available values for primary keys
 		var nextID int
@@ -1623,14 +1550,14 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string)
 }
 
 // Find optimal worker count with a given batch size
-func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName string, batchSize int) int {
+func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName string, batchSize uint) uint {
 	fmt.Fprintf(os.Stderr, "Testing worker counts with batch size %d...\n", batchSize)
 
-	maxWorkers := 8
-	bestWorkers := 1
+	maxWorkers := uint(8)
+	bestWorkers := uint(1)
 	bestPerformance := 0.0
 
-	for workers := 1; workers <= maxWorkers; workers *= 2 {
+	for workers := uint(1); workers <= maxWorkers; workers *= 2 {
 		// Get the next available values for primary keys
 		var nextID int
 		var nextCompositeKeys map[string]int
@@ -1679,23 +1606,24 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 
 // InsertOptions controls the behavior of InsertData
 type InsertOptions struct {
-	BenchmarkMode    bool               // If true, run in benchmark mode with time limits
-	MaxDuration      time.Duration      // Maximum time to run (for benchmark mode)
-	ProgressCallback func(inserted int) // Optional progress callback
-	Verbose          bool               // Enable verbose output
+	BenchmarkMode    bool                // If true, run in benchmark mode with time limits
+	MaxDuration      time.Duration       // Maximum time to run (for benchmark mode)
+	MaxRows          uint                // Maximum number of rows to insert
+	ProgressCallback func(inserted uint) // Optional progress callback
+	Verbose          bool                // Enable verbose output
 }
 
 // InsertData is a unified function that handles both real insertion and benchmarking
 func (dg *DataGenerator) InsertData(
 	config DBConfig,
 	tableName string,
-	numRows int,
-	batchSize int,
-	numWorkers int,
+	numRows uint,
+	batchSize uint,
+	numWorkers uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
 	options InsertOptions,
-) (float64, int, error) {
+) (float64, uint, error) {
 	startTime := time.Now()
 
 	// For benchmark mode, limit the number of rows to insert
@@ -1716,105 +1644,37 @@ func (dg *DataGenerator) InsertData(
 			rowsToInsert, batchSize, numWorkers, options.BenchmarkMode)
 	}
 
-	if numWorkers <= 1 {
-		// Serial insert
-		return dg.insertSerial(config, tableName, rowsToInsert, batchSize, nextID, nextCompositeKeys, options, startTime)
-	} else {
-		// Parallel insert
-		return dg.insertParallel(config, tableName, rowsToInsert, batchSize, numWorkers, nextID, nextCompositeKeys, options, startTime)
-	}
-}
-
-// insertSerial handles serial (single-worker) insertion
-func (dg *DataGenerator) insertSerial(
-	config DBConfig,
-	tableName string,
-	numRows int,
-	batchSize int,
-	nextID int,
-	nextCompositeKeys map[string]int,
-	options InsertOptions,
-	startTime time.Time,
-) (float64, int, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return 0.0, 0, fmt.Errorf("failed to connect to database: %w", err)
-	}
-	defer db.Close()
-
-	// Configure connection pool
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
-
-	// Test connection
-	if err := db.Ping(); err != nil {
-		return 0.0, 0, fmt.Errorf("failed to ping database: %w", err)
-	}
-
-	completedRows := 0
-	for i := 0; i < numRows; i += batchSize {
-		end := i + batchSize
-		if end > numRows {
-			end = numRows
-		}
-
-		// Build bulk INSERT statement for this batch
-		bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, i, end, nextID, nextCompositeKeys)
-		if err != nil {
-			return 0.0, completedRows, fmt.Errorf("failed to build insert statement: %w", err)
-		}
-
-		// Execute bulk insert
-		_, err = db.Exec(bulkInsertSQL, allValues...)
-		if err != nil {
-			return 0.0, completedRows, fmt.Errorf("failed to execute bulk insert: %w", err)
-		}
-
-		completedRows += end - i
-		if options.ProgressCallback != nil {
-			options.ProgressCallback(completedRows)
-		}
-	}
-
-	totalTime := time.Since(startTime)
-	totalRate := float64(completedRows) / totalTime.Seconds()
-
-	if !options.BenchmarkMode {
-		fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
-			completedRows, tableName, totalTime.Seconds(), totalRate)
-	}
-
-	return totalRate, completedRows, nil
+	return dg.insertParallel(config, tableName, rowsToInsert, batchSize, numWorkers, nextID, nextCompositeKeys, options, startTime)
 }
 
 // insertParallel handles parallel (multi-worker) insertion
 func (dg *DataGenerator) insertParallel(
 	config DBConfig,
 	tableName string,
-	numRows int,
-	batchSize int,
-	numWorkers int,
+	numRows uint,
+	batchSize uint,
+	numWorkers uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
 	options InsertOptions,
 	startTime time.Time,
-) (float64, int, error) {
+) (float64, uint, error) {
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
 		config.User, config.Password, config.Host, config.Port, config.Database)
 
 	// Create channels for coordination
-	jobs := make(chan int, numRows)
+	jobs := make(chan uint, numRows)
 	results := make(chan error, numWorkers)
-	progress := make(chan int, numWorkers)
+	progress := make(chan uint, numWorkers)
 	var wg sync.WaitGroup
 
 	// Start worker goroutines
-	for w := 0; w < numWorkers; w++ {
+	if numWorkers <= 1 {
+		numWorkers = 1
+	}
+	for w := uint(0); w < numWorkers; w++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func(workerID uint) {
 			defer wg.Done()
 
 			// Each worker gets its own database connection
@@ -1832,7 +1692,7 @@ func (dg *DataGenerator) insertParallel(
 
 			// Process jobs
 			for startRow := range jobs {
-				endRow := startRow + batchSize
+				endRow := uint(startRow) + batchSize
 				if endRow > numRows {
 					endRow = numRows
 				}
@@ -1859,7 +1719,7 @@ func (dg *DataGenerator) insertParallel(
 
 	// Send jobs to workers
 	go func() {
-		for i := 0; i < numRows; i += batchSize {
+		for i := uint(0); i < numRows; i += batchSize {
 			jobs <- i
 		}
 		close(jobs)
@@ -1873,7 +1733,7 @@ func (dg *DataGenerator) insertParallel(
 	}()
 
 	// Monitor progress and collect errors
-	completedRows := 0
+	completedRows := uint(0)
 
 	// Add a real-time progress ticker for non-benchmark mode
 	var progressTicker *time.Ticker
@@ -1891,7 +1751,7 @@ func (dg *DataGenerator) insertParallel(
 					if completedRows > 0 {
 						elapsed := time.Since(startTime)
 						rate := float64(completedRows) / elapsed.Seconds()
-						fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+						fmt.Fprintf(os.Stderr, "Completed C %d rows... (%.0f rows/sec)\n", completedRows, rate)
 					}
 				case <-stopTicker:
 					return
@@ -1973,13 +1833,13 @@ func main() {
 		statsShort   = flag.String("s", "", "Stats file path (short)")
 		sqlFile      = flag.String("sql", "", "SQL file path")
 		sqlFileShort = flag.String("f", "", "SQL file path (short)")
-		numRows      = flag.Int("rows", 0, "Number of rows to generate")
-		numRowsShort = flag.Int("n", 0, "Number of rows to generate (short)")
-		maxRows      = flag.Int("max-rows", 0, "Maximum number of rows to generate (0=no limit)")
+		numRows      = flag.Uint("rows", 0, "Number of rows to generate")
+		numRowsShort = flag.Uint("n", 0, "Number of rows to generate (short)")
+		maxRows      = flag.Uint("max-rows", 0, "Maximum number of rows to generate (0=no limit)")
 		insert       = flag.Bool("insert", false, "Insert data directly to database instead of outputting JSON")
 		insertShort  = flag.Bool("i", false, "Insert data directly to database (short)")
-		bulkInsert   = flag.Int("bulk", 0, "Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)")
-		workers      = flag.Int("workers", 0, "Number of parallel workers (default: 0=auto-tune, 1=serial, >1=parallel)")
+		bulkInsert   = flag.Uint("bulk", 0, "Bulk insert batch size (default: 0=auto-tune, >0=use specific batch size)")
+		workers      = flag.Uint("workers", 0, "Number of parallel workers (default: 0=auto-tune, 1=serial, >1=parallel)")
 
 		// Help
 		help      = flag.Bool("help", false, "Show help message")
@@ -2144,8 +2004,10 @@ func main() {
 		}
 
 		fmt.Println(string(output))
+		return
 
-	} else if finalTable != "" && finalDatabase != "" {
+	}
+	if finalTable != "" && finalDatabase != "" {
 		// Database mode
 		if finalSQLFile != "" {
 			fmt.Fprintf(os.Stderr, "Error: SQL file should not be specified when using database mode\n")
@@ -2182,20 +2044,12 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Auto-tuning insert for %d rows...\n", effectiveNumRows)
 
 				// Find optimal batch size if not specified
-				var optimalBatchSize int
-				maxBatchSize := 10000
+				var optimalBatchSize uint
 				if finalBulkInsert == 0 {
-					optimalBatchSize = generator.findOptimalBatchSize(config, finalTable)
-					if optimalBatchSize > maxBatchSize {
-						optimalBatchSize = maxBatchSize
-					}
+					optimalBatchSize = generator.findOptimalBatchSize(config, finalTable, effectiveNumRows)
 					fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
 				} else {
 					optimalBatchSize = finalBulkInsert
-					if optimalBatchSize > maxBatchSize {
-						fmt.Fprintf(os.Stderr, "Warning: requested batch size %d exceeds maximum of %d, capping at %d\n", optimalBatchSize, maxBatchSize, maxBatchSize)
-						optimalBatchSize = maxBatchSize
-					}
 					fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
 				}
 
@@ -2227,43 +2081,41 @@ func main() {
 				}
 
 				// Use InsertCore with optimal parameters
-				if true {
-					var mu sync.Mutex
-					inserted := 0
-					progressTicker := time.NewTicker(1 * time.Second)
-					defer progressTicker.Stop()
-					done := make(chan struct{})
-					go func() {
-						startTime := time.Now()
-						for {
-							select {
-							case <-progressTicker.C:
-								mu.Lock()
-								count := inserted
-								mu.Unlock()
-								if count > 0 {
-									elapsed := time.Since(startTime)
-									rate := float64(count) / elapsed.Seconds()
-									fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", count, rate)
-								}
-							case <-done:
-								return
-							}
-						}
-					}()
-					_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, InsertOptions{
-						BenchmarkMode: false,
-						Verbose:       finalVerbose,
-						ProgressCallback: func(n int) {
+				var mu sync.Mutex
+				inserted := uint(0)
+				progressTicker := time.NewTicker(1 * time.Second)
+				defer progressTicker.Stop()
+				done := make(chan struct{})
+				go func() {
+					startTime := time.Now()
+					for {
+						select {
+						case <-progressTicker.C:
 							mu.Lock()
-							inserted = n
+							count := inserted
 							mu.Unlock()
-						},
-					})
-					close(done)
-					if err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
+							if count > 0 {
+								elapsed := time.Since(startTime)
+								rate := float64(count) / elapsed.Seconds()
+								fmt.Fprintf(os.Stderr, "Completed D %d rows... (%.0f rows/sec)\n", count, rate)
+							}
+						case <-done:
+							return
+						}
 					}
+				}()
+				_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, InsertOptions{
+					BenchmarkMode: false,
+					Verbose:       finalVerbose,
+					ProgressCallback: func(n uint) {
+						mu.Lock()
+						inserted = n
+						mu.Unlock()
+					},
+				})
+				close(done)
+				if err != nil {
+					log.Fatalf("Failed to insert data: %v", err)
 				}
 			} else {
 				// Use InsertCore directly with specified parameters
@@ -2294,7 +2146,7 @@ func main() {
 				}
 
 				// Determine batch size
-				batchSize := 1
+				batchSize := uint(1)
 				if finalBulkInsert > 0 {
 					batchSize = finalBulkInsert
 				} else if finalWorkers > 1 {
@@ -2302,55 +2154,53 @@ func main() {
 				}
 
 				// Use InsertCore directly
-				if true {
-					var mu sync.Mutex
-					inserted := 0
-					progressTicker := time.NewTicker(1 * time.Second)
-					defer progressTicker.Stop()
-					done := make(chan struct{})
-					go func() {
-						startTime := time.Now()
-						for {
-							select {
-							case <-progressTicker.C:
-								mu.Lock()
-								count := inserted
-								mu.Unlock()
-								if count > 0 {
-									elapsed := time.Since(startTime)
-									rate := float64(count) / elapsed.Seconds()
-									fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", count, rate)
-								}
-							case <-done:
-								return
+				var mu sync.Mutex
+				inserted := uint(0)
+				progressTicker := time.NewTicker(1 * time.Second)
+				defer progressTicker.Stop()
+				done := make(chan struct{})
+				go func() {
+					startTime := time.Now()
+					for {
+						select {
+						case <-progressTicker.C:
+							mu.Lock()
+							count := inserted
+							mu.Unlock()
+							if count > 0 {
+								elapsed := time.Since(startTime)
+								rate := float64(count) / elapsed.Seconds()
+								fmt.Fprintf(os.Stderr, "Completed E %d rows... (%.0f rows/sec)\n", count, rate)
 							}
+						case <-done:
+							return
 						}
-					}()
-					err = generator.InsertCore(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, func(n int) {
-						mu.Lock()
-						inserted = n
-						mu.Unlock()
-					})
-					close(done)
-					if err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
 					}
+				}()
+				err = generator.InsertCore(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, func(n uint) {
+					mu.Lock()
+					inserted = n
+					mu.Unlock()
+				})
+				close(done)
+				if err != nil {
+					log.Fatalf("Failed to insert data: %v", err)
 				}
 			}
-		} else {
-			// Generate data and output as JSON
-			rows := generator.GenerateData(effectiveNumRows)
-			output, err := json.MarshalIndent(rows, "", "  ")
-			if err != nil {
-				log.Fatalf("Failed to marshal data: %v", err)
-			}
-			fmt.Println(string(output))
+			return
 		}
-
-	} else {
-		// Invalid mode
-		fmt.Fprintf(os.Stderr, "Error: Must specify either SQL file (-f/--sql) or database table (-t/--table) with database (-D/--database)\n")
-		flag.Usage()
-		os.Exit(1)
+		// Generate data and output as JSON
+		rows := generator.GenerateData(effectiveNumRows)
+		output, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			log.Fatalf("Failed to marshal data: %v", err)
+		}
+		fmt.Println(string(output))
+		return
 	}
+
+	// Invalid mode
+	fmt.Fprintf(os.Stderr, "Error: Must specify either SQL file (-f/--sql) or database table (-t/--table) with database (-D/--database)\n")
+	flag.Usage()
+	os.Exit(1)
 }
