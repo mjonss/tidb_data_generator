@@ -64,3 +64,7 @@ The program outputs generated data as JSON array with each row containing:
 - `test_category`: Integer category
 - `created`: ISO timestamp string
 - `calendar_date`: ISO datetime string (nullable) 
+
+## TODO
+
+- Support FOREIGN KEYs, to only insert values matching references.
