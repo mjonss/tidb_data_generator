@@ -1658,6 +1658,122 @@ func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string
 	return dg.InsertCore(config, tableName, numRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, nil)
 }
 
+// Unified benchmark function that can benchmark any combination of batch size and worker count
+func (dg *DataGenerator) BenchmarkCore(
+	config DBConfig,
+	tableName string,
+	batchSize int,
+	numWorkers int,
+	duration time.Duration,
+) (float64, int) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
+		config.User, config.Password, config.Host, config.Port, config.Database)
+
+	// Get the next available values for primary keys
+	var nextCompositeKeys map[string]int
+	var err error
+	if len(dg.tableDef.PrimaryKey) > 1 {
+		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+		if err != nil {
+			return 0.0, 0
+		}
+	}
+
+	if numWorkers <= 1 {
+		// Single worker benchmark
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			return 0.0, 0
+		}
+		defer db.Close()
+
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		db.SetConnMaxLifetime(time.Minute * 2)
+
+		if err := db.Ping(); err != nil {
+			return 0.0, 0
+		}
+
+		startTime := time.Now()
+		stopTime := startTime.Add(duration)
+		rowsInserted := 0
+		startID := 1000000 // Use high ID to avoid conflicts
+
+		for time.Now().Before(stopTime) {
+			var err error
+			if len(dg.tableDef.PrimaryKey) > 1 {
+				err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
+			} else {
+				err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
+			}
+			if err != nil {
+				break
+			}
+			rowsInserted += batchSize
+			startID += batchSize
+		}
+
+		benchmarkDuration := time.Since(startTime)
+		if benchmarkDuration.Seconds() > 0 {
+			return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
+		}
+		return 0.0, rowsInserted
+
+	} else {
+		// Multi-worker benchmark
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		rowsInserted := 0
+		stopTime := time.Now().Add(duration)
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+
+				db, err := sql.Open("mysql", dsn)
+				if err != nil {
+					return
+				}
+				defer db.Close()
+
+				db.SetMaxOpenConns(1)
+				db.SetMaxIdleConns(1)
+				db.SetConnMaxLifetime(time.Minute * 2)
+
+				if err := db.Ping(); err != nil {
+					return
+				}
+
+				startID := workerID * 10000
+				for time.Now().Before(stopTime) {
+					var err error
+					if len(dg.tableDef.PrimaryKey) > 1 {
+						err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
+					} else {
+						err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
+					}
+					if err != nil {
+						break
+					}
+					mu.Lock()
+					rowsInserted += batchSize
+					mu.Unlock()
+					startID += batchSize
+				}
+			}(w)
+		}
+		wg.Wait()
+
+		benchmarkDuration := time.Since(stopTime.Add(-duration))
+		if benchmarkDuration.Seconds() > 0 {
+			return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
+		}
+		return 0.0, rowsInserted
+	}
+}
+
 // Find optimal batch size by testing different batch sizes
 func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string) int {
 	fmt.Fprintf(os.Stderr, "Testing batch sizes...\n")
@@ -1672,7 +1788,7 @@ func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string)
 		if batchSize > maxBatchSize {
 			continue
 		}
-		performance := dg.benchmarkBatchSize(config, tableName, batchSize)
+		performance, _ := dg.BenchmarkCore(config, tableName, batchSize, 1, 1*time.Second)
 		fmt.Fprintf(os.Stderr, "  Batch size %d: %.0f rows/sec\n", batchSize, performance)
 		if performance > bestPerformance {
 			bestPerformance = performance
@@ -1692,7 +1808,7 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 	bestPerformance := 0.0
 
 	for workers := 1; workers <= maxWorkers; workers *= 2 {
-		performance, _ := dg.benchmarkWorkerCount(config, tableName, batchSize, workers)
+		performance, _ := dg.BenchmarkCore(config, tableName, batchSize, workers, 2*time.Second)
 		fmt.Fprintf(os.Stderr, "  %d workers: %.0f rows/sec\n", workers, performance)
 		if performance > bestPerformance {
 			bestPerformance = performance
@@ -1703,132 +1819,6 @@ func (dg *DataGenerator) findOptimalWorkerCount(config DBConfig, tableName strin
 	}
 
 	return bestWorkers
-}
-
-// Benchmark a specific batch size
-func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, batchSize int) float64 {
-	benchmarkDuration := 1 * time.Second
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
-
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return 0.0
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	db.SetConnMaxLifetime(time.Minute * 2)
-
-	if err := db.Ping(); err != nil {
-		return 0.0
-	}
-
-	// Get the next available values for primary keys
-	var nextCompositeKeys map[string]int
-	if len(dg.tableDef.PrimaryKey) > 1 {
-		// Composite primary key
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			return 0.0
-		}
-	}
-
-	startTime := time.Now()
-	stopTime := startTime.Add(benchmarkDuration)
-	rowsInserted := 0
-	startID := 1000000 // Use high ID to avoid conflicts
-
-	for time.Now().Before(stopTime) {
-		var err error
-		if len(dg.tableDef.PrimaryKey) > 1 {
-			err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
-		} else {
-			err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
-		}
-		if err != nil {
-			break
-		}
-		rowsInserted += batchSize
-		startID += batchSize
-	}
-
-	duration := time.Since(startTime)
-	if duration.Seconds() > 0 {
-		return float64(rowsInserted) / duration.Seconds()
-	}
-	return 0.0
-}
-
-// Benchmark a specific worker count with a given batch size
-func (dg *DataGenerator) benchmarkWorkerCount(config DBConfig, tableName string, batchSize, workers int) (float64, int) {
-	benchmarkDuration := 2 * time.Second
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	rowsInserted := 0
-	stopTime := time.Now().Add(benchmarkDuration)
-
-	// Get the next available values for primary keys
-	var nextCompositeKeys map[string]int
-	var err error
-
-	if len(dg.tableDef.PrimaryKey) > 1 {
-		// Composite primary key
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[ERROR] Failed to get next composite keys: %v\n", err)
-			return 0.0, 0
-		}
-	}
-
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-
-			dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-				config.User, config.Password, config.Host, config.Port, config.Database)
-
-			db, err := sql.Open("mysql", dsn)
-			if err != nil {
-				return
-			}
-			defer db.Close()
-
-			db.SetMaxOpenConns(1)
-			db.SetMaxIdleConns(1)
-			db.SetConnMaxLifetime(time.Minute * 2)
-
-			if err := db.Ping(); err != nil {
-				return
-			}
-
-			startID := workerID * 10000
-			for time.Now().Before(stopTime) {
-				var err error
-				if len(dg.tableDef.PrimaryKey) > 1 {
-					err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
-				} else {
-					err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
-				}
-				if err != nil {
-					break
-				}
-				mu.Lock()
-				rowsInserted += batchSize
-				mu.Unlock()
-				startID += batchSize
-			}
-		}(w)
-	}
-	wg.Wait()
-
-	duration := time.Since(stopTime.Add(-benchmarkDuration))
-	if duration.Seconds() > 0 {
-		return float64(rowsInserted) / duration.Seconds(), rowsInserted
-	}
-	return 0.0, rowsInserted
 }
 
 func main() {
