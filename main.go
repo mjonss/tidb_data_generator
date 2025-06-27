@@ -2504,6 +2504,8 @@ func (dg *DataGenerator) benchmarkBulkInsertWithDB(db *sql.DB, tableName string,
 func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string, numRows int, batchSize int) error {
 	fmt.Fprintf(os.Stderr, "Auto-tuning unified insert for %d rows...\n", numRows)
 
+	maxBatchSize := 100000
+
 	// If batchSize is 0, find optimal batch size, otherwise use the provided batch size
 	var optimalBatchSize int
 	if batchSize == 0 {
@@ -2511,6 +2513,12 @@ func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string
 		fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
 	} else {
 		optimalBatchSize = batchSize
+		// Cap the batch size at the maximum
+		if optimalBatchSize > maxBatchSize {
+			fmt.Fprintf(os.Stderr, "Warning: requested batch size %d exceeds maximum of %d, capping at %d\n",
+				optimalBatchSize, maxBatchSize, maxBatchSize)
+			optimalBatchSize = maxBatchSize
+		}
 		fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
 	}
 
@@ -2526,12 +2534,17 @@ func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string
 func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string) int {
 	fmt.Fprintf(os.Stderr, "Testing batch sizes...\n")
 
-	batchSizes := []int{1, 5, 10, 20, 50, 100, 500, 1000, 5000}
+	batchSizes := []int{1, 5, 10, 20, 50, 100, 500, 1000, 5000, 10000, 50000, 100000}
+	maxBatchSize := 100000
 
 	bestBatchSize := 1
 	bestPerformance := 0.0
 
 	for _, batchSize := range batchSizes {
+		// Skip batch sizes larger than the maximum
+		if batchSize > maxBatchSize {
+			continue
+		}
 		performance := dg.benchmarkBatchSize(config, tableName, batchSize)
 		fmt.Fprintf(os.Stderr, "  Batch size %d: %.0f rows/sec\n", batchSize, performance)
 		if performance > bestPerformance {
