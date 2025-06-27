@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -1185,7 +1186,7 @@ func (dg *DataGenerator) InsertCore(
 			}
 
 			if progressCb != nil {
-				progressCb(end)
+				progressCb(batchSize)
 			}
 		}
 
@@ -1356,109 +1357,6 @@ func (dg *DataGenerator) InsertCore(
 	return nil
 }
 
-// Refactored insert functions to use InsertCore
-func (dg *DataGenerator) InsertDataToDB(config DBConfig, tableName string, numRows int) error {
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s...\n", numRows, tableName)
-
-	// Get the next available ID to avoid duplicate key errors
-	nextID, err := getNextAvailableID(config, dg.tableDef)
-	if err != nil {
-		return fmt.Errorf("failed to get next available ID: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
-
-	// Use batch size 1 for single-row inserts
-	return dg.InsertCore(config, tableName, numRows, 1, 1, nextID, nil, func(inserted int) {
-		elapsed := time.Since(time.Now())
-		rate := float64(inserted) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", inserted, rate)
-	})
-}
-
-func (dg *DataGenerator) InsertDataToDBBulk(config DBConfig, tableName string, numRows int) error {
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using bulk inserts...\n", numRows, tableName)
-
-	// Get the next available ID to avoid duplicate key errors
-	nextID, err := getNextAvailableID(config, dg.tableDef)
-	if err != nil {
-		return fmt.Errorf("failed to get next available ID: %w", err)
-	}
-	fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
-
-	// Use larger batch size for bulk inserts
-	return dg.InsertCore(config, tableName, numRows, 10000, 1, nextID, nil, func(inserted int) {
-		elapsed := time.Since(time.Now())
-		rate := float64(inserted) / elapsed.Seconds()
-		fmt.Fprintf(os.Stderr, "Inserted %d rows... (%.0f rows/sec)\n", inserted, rate)
-	})
-}
-
-func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers...\n", numRows, tableName, numWorkers)
-
-	// Get the next available values for primary keys
-	var nextID int
-	var nextCompositeKeys map[string]int
-	var err error
-
-	if len(dg.tableDef.PrimaryKey) == 1 {
-		// Single-column primary key
-		nextID, err = getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available ID: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
-	} else if len(dg.tableDef.PrimaryKey) > 1 {
-		// Composite primary key
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available composite key: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
-		nextID = 1 // Use 1 as base for generating unique combinations
-	} else {
-		// No primary key, start from 1
-		nextID = 1
-		fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
-	}
-
-	// Use smaller batch size for better progress reporting
-	return dg.InsertCore(config, tableName, numRows, 1000, numWorkers, nextID, nextCompositeKeys, nil)
-}
-
-func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName string, numRows int, numWorkers int) error {
-	fmt.Fprintf(os.Stderr, "Inserting %d rows into table %s using %d parallel workers with bulk inserts...\n", numRows, tableName, numWorkers)
-
-	// Get the next available values for primary keys
-	var nextID int
-	var nextCompositeKeys map[string]int
-	var err error
-
-	if len(dg.tableDef.PrimaryKey) == 1 {
-		// Single-column primary key
-		nextID, err = getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available ID: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
-	} else if len(dg.tableDef.PrimaryKey) > 1 {
-		// Composite primary key
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available composite key: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
-		nextID = 1 // Use 1 as base for generating unique combinations
-	} else {
-		// No primary key, start from 1
-		nextID = 1
-		fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
-	}
-
-	// Use smaller batch size for better progress reporting
-	return dg.InsertCore(config, tableName, numRows, 1000, numWorkers, nextID, nextCompositeKeys, nil)
-}
-
 // Generate row with composite key handling
 func (dg *DataGenerator) GenerateRowWithCompositeKey(id int, nextCompositeKeys map[string]int) TableRow {
 	row := make(TableRow)
@@ -1512,152 +1410,6 @@ func (dg *DataGenerator) GenerateRowWithCompositeKey(id int, nextCompositeKeys m
 	return row
 }
 
-// Simple benchmark bulk insert function that uses an existing database connection
-func (dg *DataGenerator) benchmarkBulkInsertWithDB(db *sql.DB, tableName string, numRows int, startID int) error {
-	// Build INSERT statement - skip auto-increment columns
-	columnNames := make([]string, 0, len(dg.tableDef.Columns))
-	placeholders := make([]string, 0, len(dg.tableDef.Columns))
-
-	for _, column := range dg.tableDef.Columns {
-		// Skip auto-increment columns
-		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-			continue
-		}
-		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
-		placeholders = append(placeholders, "?")
-	}
-
-	// Build bulk INSERT statement
-	valueGroups := make([]string, 0, numRows)
-	allValues := make([]interface{}, 0, numRows*len(placeholders))
-
-	for i := 0; i < numRows; i++ {
-		row := dg.GenerateRow(startID + i)
-		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-
-		// Convert row to interface slice for query - skip auto-increment columns
-		for _, column := range dg.tableDef.Columns {
-			// Skip auto-increment columns
-			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-				continue
-			}
-			allValues = append(allValues, row[column.Name])
-		}
-	}
-
-	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-		tableName,
-		strings.Join(columnNames, ", "),
-		strings.Join(valueGroups, ", "))
-
-	// Execute bulk insert
-	_, err := db.Exec(bulkInsertSQL, allValues...)
-	if err != nil {
-		return fmt.Errorf("failed to execute bulk insert: %w", err)
-	}
-
-	return nil
-}
-
-// Simple benchmark bulk insert function that uses an existing database connection with composite key support
-func (dg *DataGenerator) benchmarkBulkInsertWithDBComposite(db *sql.DB, tableName string, numRows int, startID int, nextCompositeKeys map[string]int) error {
-	// Build INSERT statement - skip auto-increment columns
-	columnNames := make([]string, 0, len(dg.tableDef.Columns))
-	placeholders := make([]string, 0, len(dg.tableDef.Columns))
-
-	for _, column := range dg.tableDef.Columns {
-		// Skip auto-increment columns
-		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-			continue
-		}
-		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
-		placeholders = append(placeholders, "?")
-	}
-
-	// Build bulk INSERT statement
-	valueGroups := make([]string, 0, numRows)
-	allValues := make([]interface{}, 0, numRows*len(placeholders))
-
-	for i := 0; i < numRows; i++ {
-		row := dg.GenerateRowWithCompositeKey(startID+i, nextCompositeKeys)
-		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-
-		// Convert row to interface slice for query - skip auto-increment columns
-		for _, column := range dg.tableDef.Columns {
-			// Skip auto-increment columns
-			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-				continue
-			}
-			allValues = append(allValues, row[column.Name])
-		}
-	}
-
-	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-		tableName,
-		strings.Join(columnNames, ", "),
-		strings.Join(valueGroups, ", "))
-
-	// Execute bulk insert
-	_, err := db.Exec(bulkInsertSQL, allValues...)
-	if err != nil {
-		return fmt.Errorf("failed to execute bulk insert: %w", err)
-	}
-
-	return nil
-}
-
-// Unified insert method with auto-tuning for both batch size and worker count
-func (dg *DataGenerator) InsertDataToDBUnified(config DBConfig, tableName string, numRows int, batchSize int) error {
-	fmt.Fprintf(os.Stderr, "Auto-tuning unified insert for %d rows...\n", numRows)
-
-	// If batchSize is 0, find optimal batch size, otherwise use the provided batch size
-	var optimalBatchSize int
-	maxBatchSize := 10000
-	if batchSize == 0 {
-		optimalBatchSize = dg.findOptimalBatchSize(config, tableName)
-		if optimalBatchSize > maxBatchSize {
-			optimalBatchSize = maxBatchSize
-		}
-		fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
-	} else {
-		optimalBatchSize = batchSize
-		if optimalBatchSize > maxBatchSize {
-			fmt.Fprintf(os.Stderr, "Warning: requested batch size %d exceeds maximum of %d, capping at %d\n", optimalBatchSize, maxBatchSize, maxBatchSize)
-			optimalBatchSize = maxBatchSize
-		}
-		fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
-	}
-
-	// Then, find optimal worker count with the optimal batch size
-	optimalWorkers := dg.findOptimalWorkerCount(config, tableName, optimalBatchSize)
-	fmt.Fprintf(os.Stderr, "Optimal worker count: %d\n", optimalWorkers)
-
-	// Get the next available values for primary keys
-	var nextID int
-	var nextCompositeKeys map[string]int
-	var err error
-
-	if len(dg.tableDef.PrimaryKey) == 1 {
-		nextID, err = getNextAvailableID(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available ID: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
-	} else if len(dg.tableDef.PrimaryKey) > 1 {
-		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
-		if err != nil {
-			return fmt.Errorf("failed to get next available composite key: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
-		nextID = 1
-	} else {
-		nextID = 1
-		fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
-	}
-
-	return dg.InsertCore(config, tableName, numRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, nil)
-}
-
 // Unified benchmark function that can benchmark any combination of batch size and worker count
 func (dg *DataGenerator) BenchmarkCore(
 	config DBConfig,
@@ -1666,112 +1418,122 @@ func (dg *DataGenerator) BenchmarkCore(
 	numWorkers int,
 	duration time.Duration,
 ) (float64, int) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=false",
-		config.User, config.Password, config.Host, config.Port, config.Database)
+	dgDebug := func(format string, args ...interface{}) {
+		if verboseMode {
+			fmt.Fprintf(os.Stderr, format, args...)
+		}
+	}
+
+	dgDebug("[DEBUG] BenchmarkCore: starting benchmark with batchSize=%d, workers=%d, duration=%v\n", batchSize, numWorkers, duration)
 
 	// Get the next available values for primary keys
+	var nextID int
 	var nextCompositeKeys map[string]int
 	var err error
-	if len(dg.tableDef.PrimaryKey) > 1 {
+
+	if len(dg.tableDef.PrimaryKey) == 1 {
+		dgDebug("[DEBUG] BenchmarkCore: getting next available ID for single PK\n")
+		nextID, err = getNextAvailableID(config, dg.tableDef)
+		if err != nil {
+			dgDebug("[DEBUG] BenchmarkCore: failed to get next available ID: %v\n", err)
+			return 0.0, 0
+		}
+	} else if len(dg.tableDef.PrimaryKey) > 1 {
+		dgDebug("[DEBUG] BenchmarkCore: getting next available composite key\n")
 		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
 		if err != nil {
+			dgDebug("[DEBUG] BenchmarkCore: failed to get next available composite key: %v\n", err)
 			return 0.0, 0
 		}
-	}
-
-	if numWorkers <= 1 {
-		// Single worker benchmark
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			return 0.0, 0
-		}
-		defer db.Close()
-
-		db.SetMaxOpenConns(1)
-		db.SetMaxIdleConns(1)
-		db.SetConnMaxLifetime(time.Minute * 2)
-
-		if err := db.Ping(); err != nil {
-			return 0.0, 0
-		}
-
-		startTime := time.Now()
-		stopTime := startTime.Add(duration)
-		rowsInserted := 0
-		startID := 1000000 // Use high ID to avoid conflicts
-
-		for time.Now().Before(stopTime) {
-			var err error
-			if len(dg.tableDef.PrimaryKey) > 1 {
-				err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
-			} else {
-				err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
-			}
-			if err != nil {
-				break
-			}
-			rowsInserted += batchSize
-			startID += batchSize
-		}
-
-		benchmarkDuration := time.Since(startTime)
-		if benchmarkDuration.Seconds() > 0 {
-			return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
-		}
-		return 0.0, rowsInserted
-
+		nextID = 1000000 // Use high ID to avoid conflicts
 	} else {
-		// Multi-worker benchmark
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		rowsInserted := 0
-		stopTime := time.Now().Add(duration)
-
-		for w := 0; w < numWorkers; w++ {
-			wg.Add(1)
-			go func(workerID int) {
-				defer wg.Done()
-
-				db, err := sql.Open("mysql", dsn)
-				if err != nil {
-					return
-				}
-				defer db.Close()
-
-				db.SetMaxOpenConns(1)
-				db.SetMaxIdleConns(1)
-				db.SetConnMaxLifetime(time.Minute * 2)
-
-				if err := db.Ping(); err != nil {
-					return
-				}
-
-				startID := workerID * 10000
-				for time.Now().Before(stopTime) {
-					var err error
-					if len(dg.tableDef.PrimaryKey) > 1 {
-						err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
-					} else {
-						err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
-					}
-					if err != nil {
-						break
-					}
-					mu.Lock()
-					rowsInserted += batchSize
-					mu.Unlock()
-					startID += batchSize
-				}
-			}(w)
-		}
-		wg.Wait()
-
-		benchmarkDuration := time.Since(stopTime.Add(-duration))
-		if benchmarkDuration.Seconds() > 0 {
-			return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
-		}
-		return 0.0, rowsInserted
+		nextID = 1000000 // Use high ID to avoid conflicts
 	}
+
+	// Use a high start ID to avoid conflicts with existing data
+	startID := nextID + 1000000
+	dgDebug("[DEBUG] BenchmarkCore: using startID=%d\n", startID)
+
+	// Create a channel to track progress
+	progressChan := make(chan int, 1000)
+	var totalRowsInserted int
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Start a goroutine to collect progress
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		dgDebug("[DEBUG] BenchmarkCore: progress collector started\n")
+		for rows := range progressChan {
+			mu.Lock()
+			totalRowsInserted += rows
+			mu.Unlock()
+		}
+		dgDebug("[DEBUG] BenchmarkCore: progress collector finished\n")
+	}()
+
+	// Create a context with timeout for the benchmark
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+
+	// Start the insert in a goroutine
+	errChan := make(chan error, 1)
+	go func() {
+		dgDebug("[DEBUG] BenchmarkCore: insert goroutine started\n")
+		// Use InsertCore with a progress callback
+		// Use a reasonable number of rows for benchmarking (10x batch size, but at least 100)
+
+		benchmarkRows := batchSize * 10
+		if benchmarkRows < 100 {
+			benchmarkRows = 100
+		}
+		if benchmarkRows > 10000 {
+			benchmarkRows = 10000 // Cap at 10k rows for benchmarking
+		}
+		dgDebug("[DEBUG] BenchmarkCore: calling InsertCore with %d rows\n", benchmarkRows)
+		err := dg.InsertCore(config, tableName, benchmarkRows, batchSize, numWorkers, startID, nextCompositeKeys, func(inserted int) {
+			select {
+			case progressChan <- batchSize:
+			default:
+			}
+		})
+		dgDebug("[DEBUG] BenchmarkCore: InsertCore returned with err=%v\n", err)
+		errChan <- err
+		close(progressChan)
+	}()
+
+	dgDebug("[DEBUG] BenchmarkCore: waiting for completion or timeout\n")
+	// Wait for either timeout or completion
+	select {
+	case <-ctx.Done():
+		dgDebug("[DEBUG] BenchmarkCore: timeout reached\n")
+		// Benchmark timeout reached
+	case err := <-errChan:
+		dgDebug("[DEBUG] BenchmarkCore: received error from insert goroutine: %v\n", err)
+		if err != nil {
+			mu.Lock()
+			rowsInserted := totalRowsInserted
+			mu.Unlock()
+			wg.Wait()
+			return 0.0, rowsInserted
+		}
+	}
+
+	dgDebug("[DEBUG] BenchmarkCore: waiting for all goroutines to finish\n")
+	wg.Wait()
+
+	mu.Lock()
+	rowsInserted := totalRowsInserted
+	mu.Unlock()
+
+	dgDebug("[DEBUG] BenchmarkCore: finished with %d rows inserted\n", rowsInserted)
+	// Calculate performance
+	benchmarkDuration := duration
+	if benchmarkDuration.Seconds() > 0 {
+		return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
+	}
+	return 0.0, rowsInserted
 }
 
 // Find optimal batch size by testing different batch sizes
@@ -2050,31 +1812,97 @@ func main() {
 		if finalInsert {
 			// Insert data directly to database
 			if finalWorkers == 0 {
-				// Auto-tuning mode - use unified method
-				if err := generator.InsertDataToDBUnified(config, finalTable, effectiveNumRows, finalBulkInsert); err != nil {
+				// Auto-tuning mode - find optimal batch size and worker count
+				fmt.Fprintf(os.Stderr, "Auto-tuning insert for %d rows...\n", effectiveNumRows)
+
+				// Find optimal batch size if not specified
+				var optimalBatchSize int
+				maxBatchSize := 10000
+				if finalBulkInsert == 0 {
+					optimalBatchSize = generator.findOptimalBatchSize(config, finalTable)
+					if optimalBatchSize > maxBatchSize {
+						optimalBatchSize = maxBatchSize
+					}
+					fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
+				} else {
+					optimalBatchSize = finalBulkInsert
+					if optimalBatchSize > maxBatchSize {
+						fmt.Fprintf(os.Stderr, "Warning: requested batch size %d exceeds maximum of %d, capping at %d\n", optimalBatchSize, maxBatchSize, maxBatchSize)
+						optimalBatchSize = maxBatchSize
+					}
+					fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
+				}
+
+				// Find optimal worker count
+				optimalWorkers := generator.findOptimalWorkerCount(config, finalTable, optimalBatchSize)
+				fmt.Fprintf(os.Stderr, "Optimal worker count: %d\n", optimalWorkers)
+
+				// Get the next available values for primary keys
+				var nextID int
+				var nextCompositeKeys map[string]int
+				var err error
+
+				if len(tableDef.PrimaryKey) == 1 {
+					nextID, err = getNextAvailableID(config, tableDef)
+					if err != nil {
+						log.Fatalf("Failed to get next available ID: %v", err)
+					}
+					fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+				} else if len(tableDef.PrimaryKey) > 1 {
+					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
+					if err != nil {
+						log.Fatalf("Failed to get next available composite key: %v", err)
+					}
+					fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+					nextID = 1
+				} else {
+					nextID = 1
+					fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
+				}
+
+				// Use InsertCore with optimal parameters
+				if err := generator.InsertCore(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, nil); err != nil {
 					log.Fatalf("Failed to insert data: %v", err)
 				}
-			} else if finalWorkers == 1 {
-				// Serial processing (1 worker)
-				if finalBulkInsert > 0 {
-					if err := generator.InsertDataToDBBulk(config, finalTable, effectiveNumRows); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
-					}
-				} else {
-					if err := generator.InsertDataToDB(config, finalTable, effectiveNumRows); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
-					}
-				}
 			} else {
-				// Parallel processing (multiple workers)
-				if finalBulkInsert > 0 {
-					if err := generator.InsertDataToDBBulkParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
+				// Use InsertCore directly with specified parameters
+				// Get the next available values for primary keys
+				var nextID int
+				var nextCompositeKeys map[string]int
+				var err error
+
+				if len(tableDef.PrimaryKey) == 1 {
+					// Single-column primary key
+					nextID, err = getNextAvailableID(config, tableDef)
+					if err != nil {
+						log.Fatalf("Failed to get next available ID: %v", err)
 					}
+					fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+				} else if len(tableDef.PrimaryKey) > 1 {
+					// Composite primary key
+					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
+					if err != nil {
+						log.Fatalf("Failed to get next available composite key: %v", err)
+					}
+					fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+					nextID = 1 // Use 1 as base for generating unique combinations
 				} else {
-					if err := generator.InsertDataToDBParallel(config, finalTable, effectiveNumRows, finalWorkers); err != nil {
-						log.Fatalf("Failed to insert data: %v", err)
-					}
+					// No primary key, start from 1
+					nextID = 1
+					fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
+				}
+
+				// Determine batch size
+				batchSize := 1
+				if finalBulkInsert > 0 {
+					batchSize = finalBulkInsert
+				} else if finalWorkers > 1 {
+					batchSize = 1000 // Default batch size for parallel processing
+				}
+
+				// Use InsertCore directly
+				if err := generator.InsertCore(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, nil); err != nil {
+					log.Fatalf("Failed to insert data: %v", err)
 				}
 			}
 		} else {
