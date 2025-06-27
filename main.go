@@ -1555,10 +1555,10 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 
 	// Monitor progress and collect errors
 	completedRows := 0
-	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
+	lastReportedRows := 0
+	progressTicker := time.NewTicker(1 * time.Second)
 	defer progressTicker.Stop()
 
-	// Create a channel to signal when all work is done
 	done := make(chan bool)
 
 	// Start progress monitoring goroutine
@@ -1566,10 +1566,11 @@ func (dg *DataGenerator) InsertDataToDBParallel(config DBConfig, tableName strin
 		for {
 			select {
 			case <-progressTicker.C:
-				if completedRows > 0 {
+				if completedRows > lastReportedRows {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
 					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+					lastReportedRows = completedRows
 				}
 			case <-done:
 				return
@@ -1906,10 +1907,10 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 
 	// Monitor progress and collect errors
 	completedRows := 0
-	progressTicker := time.NewTicker(1 * time.Second) // Show progress every 1 second
+	lastReportedRows := 0
+	progressTicker := time.NewTicker(1 * time.Second)
 	defer progressTicker.Stop()
 
-	// Create a channel to signal when all work is done
 	done := make(chan bool)
 
 	// Start progress monitoring goroutine
@@ -1917,10 +1918,11 @@ func (dg *DataGenerator) InsertDataToDBBulkParallel(config DBConfig, tableName s
 		for {
 			select {
 			case <-progressTicker.C:
-				if completedRows > 0 {
+				if completedRows > lastReportedRows {
 					elapsed := time.Since(startTime)
 					rate := float64(completedRows) / elapsed.Seconds()
 					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", completedRows, rate)
+					lastReportedRows = completedRows
 				}
 			case <-done:
 				return
@@ -2561,6 +2563,16 @@ func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, b
 		return 0.0
 	}
 
+	// Get the next available values for primary keys
+	var nextCompositeKeys map[string]int
+	if len(dg.tableDef.PrimaryKey) > 1 {
+		// Composite primary key
+		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+		if err != nil {
+			return 0.0
+		}
+	}
+
 	startTime := time.Now()
 	stopTime := startTime.Add(benchmarkDuration)
 	rowsInserted := 0
@@ -2568,7 +2580,11 @@ func (dg *DataGenerator) benchmarkBatchSize(config DBConfig, tableName string, b
 
 	for time.Now().Before(stopTime) {
 		var err error
-		err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
+		if len(dg.tableDef.PrimaryKey) > 1 {
+			err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
+		} else {
+			err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
+		}
 		if err != nil {
 			break
 		}
@@ -2615,6 +2631,19 @@ func (dg *DataGenerator) benchmarkWorkerCount(config DBConfig, tableName string,
 	rowsInserted := 0
 	stopTime := time.Now().Add(benchmarkDuration)
 
+	// Get the next available values for primary keys
+	var nextCompositeKeys map[string]int
+	var err error
+
+	if len(dg.tableDef.PrimaryKey) > 1 {
+		// Composite primary key
+		nextCompositeKeys, err = getNextAvailableCompositeKey(config, dg.tableDef)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Failed to get next composite keys: %v\n", err)
+			return 0.0, 0
+		}
+	}
+
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -2639,7 +2668,13 @@ func (dg *DataGenerator) benchmarkWorkerCount(config DBConfig, tableName string,
 
 			startID := workerID * 10000
 			for time.Now().Before(stopTime) {
-				if err := dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID); err != nil {
+				var err error
+				if len(dg.tableDef.PrimaryKey) > 1 {
+					err = dg.benchmarkBulkInsertWithDBComposite(db, tableName, batchSize, startID, nextCompositeKeys)
+				} else {
+					err = dg.benchmarkBulkInsertWithDB(db, tableName, batchSize, startID)
+				}
+				if err != nil {
 					break
 				}
 				mu.Lock()
@@ -2929,5 +2964,52 @@ finished:
 	totalRate := float64(numRows) / totalTime.Seconds()
 	fmt.Fprintf(os.Stderr, "Successfully inserted %d rows into table %s in %.2fs (%.0f rows/sec)\n",
 		numRows, tableName, totalTime.Seconds(), totalRate)
+	return nil
+}
+
+// Simple benchmark bulk insert function that uses an existing database connection with composite key support
+func (dg *DataGenerator) benchmarkBulkInsertWithDBComposite(db *sql.DB, tableName string, numRows int, startID int, nextCompositeKeys map[string]int) error {
+	// Build INSERT statement - skip auto-increment columns
+	columnNames := make([]string, 0, len(dg.tableDef.Columns))
+	placeholders := make([]string, 0, len(dg.tableDef.Columns))
+
+	for _, column := range dg.tableDef.Columns {
+		// Skip auto-increment columns
+		if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+			continue
+		}
+		columnNames = append(columnNames, fmt.Sprintf("`%s`", column.Name))
+		placeholders = append(placeholders, "?")
+	}
+
+	// Build bulk INSERT statement
+	valueGroups := make([]string, 0, numRows)
+	allValues := make([]interface{}, 0, numRows*len(placeholders))
+
+	for i := 0; i < numRows; i++ {
+		row := dg.GenerateRowWithCompositeKey(startID+i, nextCompositeKeys)
+		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		for _, column := range dg.tableDef.Columns {
+			// Skip auto-increment columns
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			allValues = append(allValues, row[column.Name])
+		}
+	}
+
+	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(valueGroups, ", "))
+
+	// Execute bulk insert
+	_, err := db.Exec(bulkInsertSQL, allValues...)
+	if err != nil {
+		return fmt.Errorf("failed to execute bulk insert: %w", err)
+	}
+
 	return nil
 }
