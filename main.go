@@ -1448,6 +1448,7 @@ func (dg *DataGenerator) BenchmarkCore(
 	// Create a channel to track progress
 	progressChan := make(chan int, 1000)
 	var totalRowsInserted int
+	var lastReportedCount int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -1458,7 +1459,11 @@ func (dg *DataGenerator) BenchmarkCore(
 		dgDebug("[DEBUG] BenchmarkCore: progress collector started\n")
 		for rows := range progressChan {
 			mu.Lock()
-			totalRowsInserted += rows
+			// Since InsertCore provides cumulative counts, we need to track the difference
+			if rows > lastReportedCount {
+				totalRowsInserted += rows - lastReportedCount
+				lastReportedCount = rows
+			}
 			mu.Unlock()
 		}
 		dgDebug("[DEBUG] BenchmarkCore: progress collector finished\n")
@@ -1493,6 +1498,7 @@ func (dg *DataGenerator) BenchmarkCore(
 
 	// Start the insert in a goroutine
 	errChan := make(chan error, 1)
+	insertStartTime := time.Now()
 	go func() {
 		dgDebug("[DEBUG] BenchmarkCore: insert goroutine started\n")
 		// Use InsertCore with a progress callback
@@ -1508,7 +1514,7 @@ func (dg *DataGenerator) BenchmarkCore(
 		dgDebug("[DEBUG] BenchmarkCore: calling InsertCore with %d rows\n", benchmarkRows)
 		err := dg.InsertCore(config, tableName, benchmarkRows, batchSize, numWorkers, startID, nextCompositeKeys, func(inserted int) {
 			select {
-			case progressChan <- batchSize:
+			case progressChan <- inserted:
 			default:
 			}
 		})
@@ -1544,10 +1550,10 @@ func (dg *DataGenerator) BenchmarkCore(
 	mu.Unlock()
 
 	dgDebug("[DEBUG] BenchmarkCore: finished with %d rows inserted\n", rowsInserted)
-	// Calculate performance
-	benchmarkDuration := duration
-	if benchmarkDuration.Seconds() > 0 {
-		return float64(rowsInserted) / benchmarkDuration.Seconds(), rowsInserted
+	// Calculate performance using actual insert time
+	actualInsertTime := time.Since(insertStartTime)
+	if actualInsertTime.Seconds() > 0 {
+		return float64(rowsInserted) / actualInsertTime.Seconds(), rowsInserted
 	}
 	return 0.0, rowsInserted
 }
