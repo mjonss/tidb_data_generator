@@ -1184,7 +1184,7 @@ func (dg *DataGenerator) buildInsertStatement(
 
 func progressMonitor() chan uint {
 	updateCompletedRows := make(chan uint, 10)
-	fmt.Fprintf(os.Stderr, "Starting progress monitor\n")
+	log.Printf("Starting progress monitor")
 
 	// Start progress monitoring goroutine
 	go func() {
@@ -1201,12 +1201,13 @@ func progressMonitor() chan uint {
 				rateTotal := float64(completedRows) / elapsed.Seconds()
 				now := time.Now()
 				rateNow := float64(completedRows-lastReportedCount) / now.Sub(lastTime).Seconds()
-				fmt.Fprintf(os.Stderr, "\rCompleted %d rows... (%.0f rows/sec, tot %.0f rows/sec)", completedRows, rateNow, rateTotal)
+				fmt.Printf("\rCompleted %d rows... (%.0f rows/sec, tot %.0f rows/sec)", completedRows, rateNow, rateTotal)
 				lastTime = now
 				lastReportedCount = completedRows
 			case addCount, ok := <-updateCompletedRows:
 				if !ok {
-					fmt.Fprintf(os.Stderr, "\nProgress monitor closed\n")
+					fmt.Printf("\n")
+					log.Printf("Progress monitor closed")
 					return
 				}
 				completedRows += addCount
@@ -1404,7 +1405,7 @@ func (dg *DataGenerator) BenchmarkCore(
 
 // Find optimal batch size by testing different batch sizes
 func (dg *DataGenerator) findOptimalBatchSize(config DBConfig, tableName string, maxRows uint) uint {
-	fmt.Fprintf(os.Stderr, "Testing batch sizes...\n")
+	log.Printf("Testing batch sizes...\n")
 
 	batchSizes := []uint{1, 50, 1000, 10000}
 	//batchSizes := []uint{1, 5, 10, 20, 50, 100, 500, 1000, 5000, 10000}
@@ -1909,21 +1910,21 @@ func main() {
 			// Insert data directly to database
 			if finalWorkers == 0 {
 				// Auto-tuning mode - find optimal batch size and worker count
-				fmt.Fprintf(os.Stderr, "Auto-tuning insert for %d rows...\n", effectiveNumRows)
+				log.Printf("Auto-tuning insert for %d rows...\n", effectiveNumRows)
 
 				// Find optimal batch size if not specified
 				var optimalBatchSize uint
 				if finalBulkInsert == 0 {
 					optimalBatchSize = generator.findOptimalBatchSize(config, finalTable, effectiveNumRows)
-					fmt.Fprintf(os.Stderr, "Optimal batch size: %d rows\n", optimalBatchSize)
+					log.Printf("Optimal batch size: %d rows\n", optimalBatchSize)
 				} else {
 					optimalBatchSize = finalBulkInsert
-					fmt.Fprintf(os.Stderr, "Using specified batch size: %d rows\n", optimalBatchSize)
+					log.Printf("Using specified batch size: %d rows\n", optimalBatchSize)
 				}
 
 				// Find optimal worker count
 				optimalWorkers := generator.findOptimalWorkerCount(config, finalTable, optimalBatchSize)
-				fmt.Fprintf(os.Stderr, "Optimal worker count: %d\n", optimalWorkers)
+				log.Printf("Optimal worker count: %d\n", optimalWorkers)
 
 				// Get the next available values for primary keys
 				var nextID int
@@ -1935,17 +1936,17 @@ func main() {
 					if err != nil {
 						log.Fatalf("Failed to get next available ID: %v", err)
 					}
-					fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+					log.Printf("Starting with ID: %d\n", nextID)
 				} else if len(tableDef.PrimaryKey) > 1 {
 					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
 					if err != nil {
 						log.Fatalf("Failed to get next available composite key: %v", err)
 					}
-					fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+					log.Printf("Starting with composite keys: %v\n", nextCompositeKeys)
 					nextID = 1
 				} else {
 					nextID = 1
-					fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
+					log.Printf("No primary key found, starting from ID: %d\n", nextID)
 				}
 
 				_, _, err = generator.InsertData(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, InsertOptions{
@@ -1967,19 +1968,19 @@ func main() {
 					if err != nil {
 						log.Fatalf("Failed to get next available ID: %v", err)
 					}
-					fmt.Fprintf(os.Stderr, "Starting with ID: %d\n", nextID)
+					log.Printf("Starting with ID: %d\n", nextID)
 				} else if len(tableDef.PrimaryKey) > 1 {
 					// Composite primary key
 					nextCompositeKeys, err = getNextAvailableCompositeKey(config, tableDef)
 					if err != nil {
 						log.Fatalf("Failed to get next available composite key: %v", err)
 					}
-					fmt.Fprintf(os.Stderr, "Starting with composite keys: %v\n", nextCompositeKeys)
+					log.Printf("Starting with composite keys: %v\n", nextCompositeKeys)
 					nextID = 1 // Use 1 as base for generating unique combinations
 				} else {
 					// No primary key, start from 1
 					nextID = 1
-					fmt.Fprintf(os.Stderr, "No primary key found, starting from ID: %d\n", nextID)
+					log.Printf("No primary key found, starting from ID: %d\n", nextID)
 				}
 
 				// Determine batch size
