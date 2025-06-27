@@ -1099,17 +1099,13 @@ func getEffectiveNumRows(generator *DataGenerator, commandLineRows int, maxRows 
 	return 1000
 }
 
-// Core insert function: handles batch size, parallelism, and PK type
-func (dg *DataGenerator) InsertCore(
-	config DBConfig,
+// buildInsertStatement builds a single INSERT statement for a batch of rows
+func (dg *DataGenerator) buildInsertStatement(
 	tableName string,
-	numRows int,
-	batchSize int,
-	numWorkers int,
+	startRow, endRow int,
 	nextID int,
 	nextCompositeKeys map[string]int,
-	progressCb func(inserted int),
-) error {
+) (string, []interface{}, error) {
 	// Build INSERT statement - skip auto-increment columns
 	columnNames := make([]string, 0, len(dg.tableDef.Columns))
 	placeholders := make([]string, 0, len(dg.tableDef.Columns))
@@ -1121,6 +1117,50 @@ func (dg *DataGenerator) InsertCore(
 		placeholders = append(placeholders, "?")
 	}
 
+	// Build bulk INSERT statement for this batch
+	valueGroups := make([]string, 0, endRow-startRow)
+	allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
+
+	for rowID := startRow; rowID < endRow; rowID++ {
+		var row TableRow
+		if len(dg.tableDef.PrimaryKey) == 1 {
+			row = dg.GenerateRow(nextID + rowID)
+		} else if len(dg.tableDef.PrimaryKey) > 1 {
+			row = dg.GenerateRowWithCompositeKey(nextID+rowID, nextCompositeKeys)
+		} else {
+			row = dg.GenerateRow(nextID + rowID)
+		}
+
+		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+
+		// Convert row to interface slice for query - skip auto-increment columns
+		for _, column := range dg.tableDef.Columns {
+			if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
+				continue
+			}
+			allValues = append(allValues, row[column.Name])
+		}
+	}
+
+	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
+		tableName,
+		strings.Join(columnNames, ", "),
+		strings.Join(valueGroups, ", "))
+
+	return bulkInsertSQL, allValues, nil
+}
+
+// Core insert function: handles batch size, parallelism, and PK type
+func (dg *DataGenerator) InsertCore(
+	config DBConfig,
+	tableName string,
+	numRows int,
+	batchSize int,
+	numWorkers int,
+	nextID int,
+	nextCompositeKeys map[string]int,
+	progressCb func(inserted int),
+) error {
 	startTime := time.Now()
 
 	if numWorkers <= 1 {
@@ -1143,6 +1183,7 @@ func (dg *DataGenerator) InsertCore(
 			return fmt.Errorf("failed to ping database: %w", err)
 		}
 
+		completedRows := 0
 		for i := 0; i < numRows; i += batchSize {
 			end := i + batchSize
 			if end > numRows {
@@ -1150,43 +1191,20 @@ func (dg *DataGenerator) InsertCore(
 			}
 
 			// Build bulk INSERT statement for this batch
-			valueGroups := make([]string, 0, end-i)
-			allValues := make([]interface{}, 0, (end-i)*len(placeholders))
-
-			for rowID := i; rowID < end; rowID++ {
-				var row TableRow
-				if len(dg.tableDef.PrimaryKey) == 1 {
-					row = dg.GenerateRow(nextID + rowID)
-				} else if len(dg.tableDef.PrimaryKey) > 1 {
-					row = dg.GenerateRowWithCompositeKey(nextID+rowID, nextCompositeKeys)
-				} else {
-					row = dg.GenerateRow(nextID + rowID)
-				}
-
-				valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-
-				// Convert row to interface slice for query - skip auto-increment columns
-				for _, column := range dg.tableDef.Columns {
-					if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-						continue
-					}
-					allValues = append(allValues, row[column.Name])
-				}
+			bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, i, end, nextID, nextCompositeKeys)
+			if err != nil {
+				return fmt.Errorf("failed to build insert statement: %w", err)
 			}
 
-			bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-				tableName,
-				strings.Join(columnNames, ", "),
-				strings.Join(valueGroups, ", "))
-
 			// Execute bulk insert
-			_, err := db.Exec(bulkInsertSQL, allValues...)
+			_, err = db.Exec(bulkInsertSQL, allValues...)
 			if err != nil {
 				return fmt.Errorf("failed to execute bulk insert: %w", err)
 			}
 
+			completedRows += end - i
 			if progressCb != nil {
-				progressCb(batchSize)
+				progressCb(completedRows)
 			}
 		}
 
@@ -1233,41 +1251,14 @@ func (dg *DataGenerator) InsertCore(
 					}
 
 					// Build bulk INSERT statement for this batch
-					valueGroups := make([]string, 0, endRow-startRow)
-					allValues := make([]interface{}, 0, (endRow-startRow)*len(placeholders))
-
-					for rowID := startRow; rowID < endRow; rowID++ {
-						// Generate row with proper ID handling
-						var row TableRow
-						if len(dg.tableDef.PrimaryKey) == 1 {
-							// Single-column primary key
-							row = dg.GenerateRow(nextID + rowID)
-						} else if len(dg.tableDef.PrimaryKey) > 1 {
-							// Composite primary key - generate with offset
-							row = dg.GenerateRowWithCompositeKey(nextID+rowID, nextCompositeKeys)
-						} else {
-							// No primary key
-							row = dg.GenerateRow(nextID + rowID)
-						}
-
-						valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
-
-						// Convert row to interface slice for query - skip auto-increment columns
-						for _, column := range dg.tableDef.Columns {
-							if strings.Contains(strings.ToLower(column.Extra), "auto_increment") {
-								continue
-							}
-							allValues = append(allValues, row[column.Name])
-						}
+					bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
+					if err != nil {
+						results <- fmt.Errorf("worker %d failed to build insert statement: %w", workerID, err)
+						return
 					}
 
-					bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
-						tableName,
-						strings.Join(columnNames, ", "),
-						strings.Join(valueGroups, ", "))
-
 					// Execute bulk insert
-					_, err := workerDB.Exec(bulkInsertSQL, allValues...)
+					_, err = workerDB.Exec(bulkInsertSQL, allValues...)
 					if err != nil {
 						results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
 						return
@@ -1320,7 +1311,7 @@ func (dg *DataGenerator) InsertCore(
 		// Collect progress updates and errors
 		for {
 			select {
-			case batchSize, ok := <-progress:
+			case rowsInserted, ok := <-progress:
 				if !ok {
 					// Progress channel closed, check for errors
 					for err := range results {
@@ -1332,7 +1323,7 @@ func (dg *DataGenerator) InsertCore(
 					done <- true
 					goto finished
 				}
-				completedRows += batchSize
+				completedRows += rowsInserted
 				if completedRows > numRows {
 					completedRows = numRows
 				}
@@ -1473,6 +1464,29 @@ func (dg *DataGenerator) BenchmarkCore(
 		dgDebug("[DEBUG] BenchmarkCore: progress collector finished\n")
 	}()
 
+	// Add a real-time progress ticker
+	progressTicker := time.NewTicker(1 * time.Second)
+	defer progressTicker.Stop()
+	stopTicker := make(chan struct{})
+	go func() {
+		startTime := time.Now()
+		for {
+			select {
+			case <-progressTicker.C:
+				mu.Lock()
+				inserted := totalRowsInserted
+				mu.Unlock()
+				if inserted > 0 {
+					elapsed := time.Since(startTime)
+					rate := float64(inserted) / elapsed.Seconds()
+					fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", inserted, rate)
+				}
+			case <-stopTicker:
+				return
+			}
+		}
+	}()
+
 	// Create a context with timeout for the benchmark
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
@@ -1515,11 +1529,13 @@ func (dg *DataGenerator) BenchmarkCore(
 			mu.Lock()
 			rowsInserted := totalRowsInserted
 			mu.Unlock()
+			close(stopTicker)
 			wg.Wait()
 			return 0.0, rowsInserted
 		}
 	}
 
+	close(stopTicker)
 	dgDebug("[DEBUG] BenchmarkCore: waiting for all goroutines to finish\n")
 	wg.Wait()
 
@@ -1861,8 +1877,39 @@ func main() {
 				}
 
 				// Use InsertCore with optimal parameters
-				if err := generator.InsertCore(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, nil); err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
+				if true {
+					var mu sync.Mutex
+					inserted := 0
+					progressTicker := time.NewTicker(1 * time.Second)
+					defer progressTicker.Stop()
+					done := make(chan struct{})
+					go func() {
+						startTime := time.Now()
+						for {
+							select {
+							case <-progressTicker.C:
+								mu.Lock()
+								count := inserted
+								mu.Unlock()
+								if count > 0 {
+									elapsed := time.Since(startTime)
+									rate := float64(count) / elapsed.Seconds()
+									fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", count, rate)
+								}
+							case <-done:
+								return
+							}
+						}
+					}()
+					err := generator.InsertCore(config, finalTable, effectiveNumRows, optimalBatchSize, optimalWorkers, nextID, nextCompositeKeys, func(n int) {
+						mu.Lock()
+						inserted = n
+						mu.Unlock()
+					})
+					close(done)
+					if err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
 				}
 			} else {
 				// Use InsertCore directly with specified parameters
@@ -1901,8 +1948,39 @@ func main() {
 				}
 
 				// Use InsertCore directly
-				if err := generator.InsertCore(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, nil); err != nil {
-					log.Fatalf("Failed to insert data: %v", err)
+				if true {
+					var mu sync.Mutex
+					inserted := 0
+					progressTicker := time.NewTicker(1 * time.Second)
+					defer progressTicker.Stop()
+					done := make(chan struct{})
+					go func() {
+						startTime := time.Now()
+						for {
+							select {
+							case <-progressTicker.C:
+								mu.Lock()
+								count := inserted
+								mu.Unlock()
+								if count > 0 {
+									elapsed := time.Since(startTime)
+									rate := float64(count) / elapsed.Seconds()
+									fmt.Fprintf(os.Stderr, "Completed %d rows... (%.0f rows/sec)\n", count, rate)
+								}
+							case <-done:
+								return
+							}
+						}
+					}()
+					err := generator.InsertCore(config, finalTable, effectiveNumRows, batchSize, finalWorkers, nextID, nextCompositeKeys, func(n int) {
+						mu.Lock()
+						inserted = n
+						mu.Unlock()
+					})
+					close(done)
+					if err != nil {
+						log.Fatalf("Failed to insert data: %v", err)
+					}
 				}
 			}
 		} else {
