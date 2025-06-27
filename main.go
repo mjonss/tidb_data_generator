@@ -1110,7 +1110,7 @@ func (dg *DataGenerator) buildInsertStatement(
 	startRow, endRow uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
-) (string, []interface{}, error) {
+) (string, []interface{}) {
 	// Build INSERT statement - skip auto-increment columns
 	columnNames := make([]string, 0, len(dg.tableDef.Columns))
 	placeholders := make([]string, 0, len(dg.tableDef.Columns))
@@ -1136,7 +1136,7 @@ func (dg *DataGenerator) buildInsertStatement(
 			row = dg.GenerateRow(nextID + rowID)
 		}
 
-		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
+		valueGroups = append(valueGroups, fmt.Sprintf("(%s)", strings.Join(placeholders, ",")))
 
 		// Convert row to interface slice for query - skip auto-increment columns
 		for _, column := range dg.tableDef.Columns {
@@ -1146,13 +1146,16 @@ func (dg *DataGenerator) buildInsertStatement(
 			allValues = append(allValues, row[column.Name])
 		}
 	}
+	debugPrint("[DEBUG] buildInsertStatement: valueGroups: %d\n", len(valueGroups))
+	debugPrint("[DEBUG] buildInsertStatement: allValues: %d\n", len(allValues))
 
 	bulkInsertSQL := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s",
 		tableName,
 		strings.Join(columnNames, ", "),
 		strings.Join(valueGroups, ", "))
 
-	return bulkInsertSQL, allValues, nil
+	debugPrint("[DEBUG] buildInsertStatement: bulkInsertSQL: %d\n", len(bulkInsertSQL))
+	return bulkInsertSQL, allValues
 }
 
 func progressMonitor() chan uint {
@@ -1571,16 +1574,12 @@ func (dg *DataGenerator) InsertData(
 				}
 
 				// Build bulk INSERT statement for this batch
-				bulkInsertSQL, allValues, err := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
-				if err != nil {
-					results <- fmt.Errorf("worker %d failed to build insert statement: %w", workerID, err)
-					return
-				}
+				bulkInsertSQL, allValues := dg.buildInsertStatement(tableName, startRow, endRow, nextID, nextCompositeKeys)
 
 				// Execute bulk insert
 				_, err = workerDB.Exec(bulkInsertSQL, allValues...)
 				if err != nil {
-					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w", workerID, err)
+					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w len all values: %d startRow: %d endRow: %d\n%s", workerID, err, len(allValues), startRow, endRow, bulkInsertSQL)
 					return
 				}
 
