@@ -342,6 +342,17 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			randomDays := dg.rand.Intn(365 * 5) // 5 years range
 			return baseTime.AddDate(0, 0, randomDays).Format("2006-01-02")
 		}
+	case "time":
+		return func() interface{} {
+			if dg.rand.Float32() < float32(nullProbability) {
+				return nil
+			}
+			// Generate random time in HH:MM:SS format
+			hours := dg.rand.Intn(24)
+			minutes := dg.rand.Intn(60)
+			seconds := dg.rand.Intn(60)
+			return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+		}
 	case "float", "double", "decimal":
 		return func() interface{} {
 			if dg.rand.Float32() < float32(nullProbability) {
