@@ -23,7 +23,7 @@ import (
 var verboseMode bool
 
 // Debug helper function
-func debugPrint(format string, args ...interface{}) {
+func debugPrint(format string, args ...any) {
 	if verboseMode {
 		fmt.Fprintf(os.Stderr, format, args...)
 	}
@@ -83,14 +83,14 @@ type TopNItem struct {
 }
 
 // Generic table row structure
-type TableRow map[string]interface{}
+type TableRow map[string]any
 
 // Data generator
 type DataGenerator struct {
 	tableDef         *TableDef
 	stats            *Stats
 	rand             *rand.Rand
-	columnGenerators map[string]func() interface{}
+	columnGenerators map[string]func() any
 }
 
 // Database connection structure
@@ -126,7 +126,7 @@ func NewDataGenerator(sqlFile, statsFile string) (*DataGenerator, error) {
 		tableDef:         tableDef,
 		stats:            stats,
 		rand:             rand.New(rand.NewSource(seed)),
-		columnGenerators: make(map[string]func() interface{}),
+		columnGenerators: make(map[string]func() any),
 	}
 
 	// Initialize column generators
@@ -249,7 +249,7 @@ func (dg *DataGenerator) initializeColumnGenerators() {
 	}
 }
 
-func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interface{} {
+func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() any {
 	// Extract base type name (remove precision/scale info)
 	baseType := column.Type
 	if idx := strings.Index(baseType, "("); idx != -1 {
@@ -282,14 +282,14 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 
 	switch baseType {
 	case "int", "integer", "bigint", "smallint", "mediumint":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Intn(10000)
 		}
 	case "year":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -298,7 +298,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			return year
 		}
 	case "varchar", "char", "text":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -316,7 +316,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			return fallbackValue
 		}
 	case "timestamp", "datetime":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -333,7 +333,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			return randomTime.Format("2006-01-02 15:04:05")
 		}
 	case "date":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -343,7 +343,7 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			return baseTime.AddDate(0, 0, randomDays).Format("2006-01-02")
 		}
 	case "time":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -354,21 +354,21 @@ func (dg *DataGenerator) createColumnGenerator(column ColumnDef) func() interfac
 			return fmt.Sprintf("%02d:%02d:%02d", hours, minutes, seconds)
 		}
 	case "float", "double", "decimal":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Float64() * 1000
 		}
 	case "boolean", "bool", "tinyint":
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
 			return dg.rand.Float32() > 0.5
 		}
 	default:
-		return func() interface{} {
+		return func() any {
 			if dg.rand.Float32() < float32(nullProbability) {
 				return nil
 			}
@@ -612,7 +612,7 @@ func (dg *DataGenerator) GenerateRow(id int) TableRow {
 }
 
 // Helper: extract representative values for a column from stats
-func (dg *DataGenerator) getColumnValueSet(colName string, max uint) []interface{} {
+func (dg *DataGenerator) getColumnValueSet(colName string, max uint) []any {
 	if dg.stats == nil {
 		return nil
 	}
@@ -620,7 +620,7 @@ func (dg *DataGenerator) getColumnValueSet(colName string, max uint) []interface
 	if !ok {
 		return nil
 	}
-	values := []interface{}{}
+	values := []any{}
 	// Use TopN if available
 	if colStats.CMSketch != nil && len(colStats.CMSketch.TopN) > 0 {
 		for _, item := range colStats.CMSketch.TopN {
@@ -664,8 +664,8 @@ func (dg *DataGenerator) getColumnValueSet(colName string, max uint) []interface
 }
 
 // Generate unique combinations for composite keys using stats
-func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numRows uint) [][]interface{} {
-	valueSets := make([][]interface{}, len(keyCols))
+func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numRows uint) [][]any {
+	valueSets := make([][]any, len(keyCols))
 	for i, col := range keyCols {
 		valueSets[i] = dg.getColumnValueSet(col, numRows)
 		if len(valueSets[i]) == 0 {
@@ -676,14 +676,14 @@ func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numR
 		}
 	}
 	// Generate cartesian product up to numRows
-	combos := [][]interface{}{}
-	var generate func(idx int, current []interface{})
-	generate = func(idx int, current []interface{}) {
+	combos := [][]any{}
+	var generate func(idx int, current []any)
+	generate = func(idx int, current []any) {
 		if len(combos) >= int(numRows) {
 			return
 		}
 		if idx == len(valueSets) {
-			combo := make([]interface{}, len(current))
+			combo := make([]any, len(current))
 			copy(combo, current)
 			combos = append(combos, combo)
 			return
@@ -692,7 +692,7 @@ func (dg *DataGenerator) generateCompositeKeyCombinations(keyCols []string, numR
 			generate(idx+1, append(current, v))
 		}
 	}
-	generate(0, []interface{}{})
+	generate(0, []any{})
 	return combos
 }
 
@@ -710,7 +710,7 @@ func (dg *DataGenerator) GenerateData(numRows uint) []TableRow {
 	}
 
 	// Precompute composite key combos if possible
-	compositeCombos := map[string][][]interface{}{}
+	compositeCombos := map[string][][]any{}
 	for _, colSet := range keyCols {
 		if len(colSet) > 1 {
 			combos := dg.generateCompositeKeyCombinations(colSet, numRows)
@@ -963,7 +963,7 @@ func NewDataGeneratorFromTableDef(tableDef *TableDef, statsFile string) (*DataGe
 		tableDef:         tableDef,
 		stats:            stats,
 		rand:             rand.New(rand.NewSource(time.Now().UnixNano())),
-		columnGenerators: make(map[string]func() interface{}),
+		columnGenerators: make(map[string]func() any),
 	}
 
 	// Initialize column generators
@@ -1013,7 +1013,7 @@ func getNextAvailableCompositeKey(config DBConfig, tableDef *TableDef) (map[stri
 
 	// Scan results
 	values := make([]sql.NullInt64, len(tableDef.PrimaryKey))
-	valuePtrs := make([]interface{}, len(tableDef.PrimaryKey))
+	valuePtrs := make([]any, len(tableDef.PrimaryKey))
 	for i := range values {
 		valuePtrs[i] = &values[i]
 	}
@@ -1144,7 +1144,7 @@ func (dg *DataGenerator) buildInsertStatement(
 	startRow, endRow uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
-) (string, []interface{}, uint) {
+) (string, []any, uint) {
 	// Build INSERT statement - skip auto-increment columns
 	columnNames := make([]string, 0, len(dg.tableDef.Columns))
 	placeholders := make([]string, 0, len(dg.tableDef.Columns))
@@ -1158,7 +1158,7 @@ func (dg *DataGenerator) buildInsertStatement(
 
 	// Build bulk INSERT statement for this batch
 	valueGroups := make([]string, 0, endRow-startRow)
-	allValues := make([]interface{}, 0, int(endRow-startRow)*len(placeholders))
+	allValues := make([]any, 0, int(endRow-startRow)*len(placeholders))
 
 	if uint(endRow-startRow)*uint(len(placeholders)) >= 64*1024 {
 		endRow = startRow + 64*1024/uint(len(placeholders))
