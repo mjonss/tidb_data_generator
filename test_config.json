@@ -1,0 +1,42 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 4000,
+    "user": "root",
+    "password": "",
+    "database": "test"
+  },
+  "test_tables": {
+    "simple": "CREATE TABLE simple_test (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, age INT)",
+    "complex": "CREATE TABLE complex_test (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(100), age INT, salary DECIMAL(10,2), is_active BOOLEAN DEFAULT TRUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+    "nullable": "CREATE TABLE nullable_test (id INT AUTO_INCREMENT PRIMARY KEY, nullable_col VARCHAR(255), not_nullable_col VARCHAR(255) NOT NULL, optional_int INT)"
+  },
+  "test_stats": {
+    "simple": {
+      "columns": {
+        "name": {
+          "cm_sketch": {
+            "top_n": [
+              {"data": "Sm9obiBEb2U=", "count": 100},
+              {"data": "SmFuZSBTbWl0aA==", "count": 80},
+              {"data": "Qm9iIEpvaG5zb24=", "count": 60}
+            ],
+            "default_value": 10
+          },
+          "null_count": 0
+        },
+        "age": {
+          "histogram": {
+            "ndv": 100,
+            "buckets": [
+              {"count": 50, "lower_bound": "MTg=", "upper_bound": "MjU=", "repeats": 0, "ndv": 25},
+              {"count": 30, "lower_bound": "MjU=", "upper_bound": "MzU=", "repeats": 0, "ndv": 30},
+              {"count": 20, "lower_bound": "MzU=", "upper_bound": "NjA=", "repeats": 0, "ndv": 45}
+            ]
+          },
+          "null_count": 5
+        }
+      }
+    }
+  }
+} 

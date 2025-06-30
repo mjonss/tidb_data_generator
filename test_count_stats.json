@@ -1,0 +1,17 @@
+{
+  "count": 3,
+  "columns": {
+    "test_type": {
+      "cm_sketch": {
+        "top_n": [
+          {"data": "RmxpcC1mbG9wcw==", "count": 100},
+          {"data": "R2xhc3Nlcw==", "count": 80},
+          {"data": "U2hvcnRz", "count": 60},
+          {"data": "U29ja3M=", "count": 40}
+        ],
+        "default_value": 10
+      },
+      "null_count": 0
+    }
+  }
+} 
