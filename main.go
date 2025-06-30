@@ -1432,7 +1432,8 @@ func (dg *DataGenerator) InsertData(
 
 	// Create channels for coordination
 	jobs := make(chan Jobs, 10)
-	results := make(chan error, numWorkers)
+	results := make(chan error)
+	done := make(chan struct{})
 	var reportChan chan uint
 	var wg sync.WaitGroup
 
@@ -1496,14 +1497,10 @@ func (dg *DataGenerator) InsertData(
 		close(jobs)
 	}()
 
-	// Wait for all workers to complete
+	// Wait for all workers to complete and signal done
 	go func() {
 		wg.Wait()
-		close(results)
-		close(progressChan)
-		if reportChan != nil {
-			close(reportChan)
-		}
+		close(done)
 	}()
 
 	// Monitor progress and collect errors
@@ -1535,6 +1532,13 @@ Loop:
 			if err != nil {
 				return 0.0, completedRows, fmt.Errorf("parallel insert failed: %w", err)
 			}
+		case <-done:
+			// All workers completed, close channels and exit
+			close(progressChan)
+			if reportChan != nil {
+				close(reportChan)
+			}
+			break Loop
 		}
 	}
 
