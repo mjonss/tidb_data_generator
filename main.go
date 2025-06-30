@@ -1144,7 +1144,7 @@ func (dg *DataGenerator) buildInsertStatement(
 	startRow, endRow uint,
 	nextID int,
 	nextCompositeKeys map[string]int,
-) (string, []interface{}) {
+) (string, []interface{}, uint) {
 	// Build INSERT statement - skip auto-increment columns
 	columnNames := make([]string, 0, len(dg.tableDef.Columns))
 	placeholders := make([]string, 0, len(dg.tableDef.Columns))
@@ -1159,6 +1159,10 @@ func (dg *DataGenerator) buildInsertStatement(
 	// Build bulk INSERT statement for this batch
 	valueGroups := make([]string, 0, endRow-startRow)
 	allValues := make([]interface{}, 0, int(endRow-startRow)*len(placeholders))
+
+	if uint(endRow-startRow)*uint(len(placeholders)) >= 64*1024 {
+		endRow = startRow + 64*1024/uint(len(placeholders))
+	}
 
 	for rowID := int(startRow); rowID < int(endRow); rowID++ {
 		var row TableRow
@@ -1189,7 +1193,7 @@ func (dg *DataGenerator) buildInsertStatement(
 		strings.Join(valueGroups, ", "))
 
 	debugPrint("[DEBUG] buildInsertStatement: bulkInsertSQL: %d\n", len(bulkInsertSQL))
-	return bulkInsertSQL, allValues
+	return bulkInsertSQL, allValues, endRow
 }
 
 func progressMonitor(rowsToInsert, maxRows uint) chan uint {
@@ -1467,17 +1471,20 @@ func (dg *DataGenerator) InsertData(
 			// Process jobs
 			for job := range jobs {
 				// Build bulk INSERT statement for this batch
-				bulkInsertSQL, allValues := dg.buildInsertStatement(tableName, job.StartRow, job.EndRow, nextID, nextCompositeKeys)
+				for job.StartRow < job.EndRow {
+					bulkInsertSQL, allValues, endRow := dg.buildInsertStatement(tableName, job.StartRow, job.EndRow, nextID, nextCompositeKeys)
 
-				// Execute bulk insert
-				_, err = workerDB.Exec(bulkInsertSQL, allValues...)
-				if err != nil {
-					results <- fmt.Errorf("worker %d failed to execute bulk insert: %w len all values: %d startRow: %d endRow: %d len sql %d", workerID, err, len(allValues), job.StartRow, job.EndRow, len(bulkInsertSQL))
-					return
+					// Execute bulk insert
+					_, err = workerDB.Exec(bulkInsertSQL, allValues...)
+					if err != nil {
+						results <- fmt.Errorf("worker %d failed to execute bulk insert: %w len all values: %d startRow: %d endRow: %d len sql %d", workerID, err, len(allValues), job.StartRow, job.EndRow, len(bulkInsertSQL))
+						return
+					}
+
+					// Send progress update
+					progressChan <- endRow - job.StartRow
+					job.StartRow = endRow
 				}
-
-				// Send progress update
-				progressChan <- job.EndRow - job.StartRow
 				if options.MaxDuration > 0 && time.Since(startTime) > options.MaxDuration {
 					break
 				}
